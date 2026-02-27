@@ -51,6 +51,8 @@ class IDALogger:
             ida_kernwin.msg(f"{IDALogger.PREFIX} DEBUG: {msg}\n")
         else:
             print(f"{IDALogger.PREFIX} DEBUG: {msg}")
+        if _qt_handler is not None:
+            _qt_handler.emit(logging.LogRecord("idassist_mcp", logging.DEBUG, "", 0, f"DEBUG: {msg}", (), None))
 
     @staticmethod
     def log_info(msg):
@@ -58,6 +60,8 @@ class IDALogger:
             ida_kernwin.msg(f"{IDALogger.PREFIX} INFO: {msg}\n")
         else:
             print(f"{IDALogger.PREFIX} INFO: {msg}")
+        if _qt_handler is not None:
+            _qt_handler.emit(logging.LogRecord("idassist_mcp", logging.INFO, "", 0, f"INFO: {msg}", (), None))
 
     @staticmethod
     def log_warn(msg):
@@ -65,6 +69,8 @@ class IDALogger:
             ida_kernwin.msg(f"{IDALogger.PREFIX} WARN: {msg}\n")
         else:
             print(f"{IDALogger.PREFIX} WARN: {msg}")
+        if _qt_handler is not None:
+            _qt_handler.emit(logging.LogRecord("idassist_mcp", logging.WARNING, "", 0, f"WARN: {msg}", (), None))
 
     @staticmethod
     def log_error(msg):
@@ -72,10 +78,30 @@ class IDALogger:
             ida_kernwin.msg(f"{IDALogger.PREFIX} ERROR: {msg}\n")
         else:
             print(f"{IDALogger.PREFIX} ERROR: {msg}")
+        if _qt_handler is not None:
+            _qt_handler.emit(logging.LogRecord("idassist_mcp", logging.ERROR, "", 0, f"ERROR: {msg}", (), None))
 
 
 # Global logger instance
 log = IDALogger()
+
+# Qt log handler reference (set by install_qt_handler)
+_qt_handler = None
+
+
+def install_qt_handler(handler):
+    """Install a QLogHandler to receive copies of all log messages.
+
+    Args:
+        handler: A QLogHandler instance from ui.log_tab
+    """
+    global _qt_handler
+    _qt_handler = handler
+
+
+def get_qt_handler():
+    """Get the currently installed Qt handler, or None."""
+    return _qt_handler
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -328,7 +328,8 @@ class IDAssistMCPServer:
     def _register_tools(self, mcp: FastMCP):
         """Register all MCP tools"""
         from .tools import register_tools
-        register_tools(mcp)
+        disabled = set(self.config.disabled_tools)
+        register_tools(mcp, disabled_tools=disabled)
 
     def _register_resources(self, mcp: FastMCP):
         """Register all MCP resources"""

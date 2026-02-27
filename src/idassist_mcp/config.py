@@ -5,14 +5,18 @@ This module provides configuration management using Pydantic settings
 with environment variable support (IDASSISTMCP_ prefix).
 """
 
+import json
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from pydantic_settings import BaseSettings
 
 from .logging import log
+
+# Default path for persistent JSON config
+DEFAULT_CONFIG_PATH = Path.home() / ".idapro" / "idassistmcp_config.json"
 
 
 class TransportType(str, Enum):
@@ -75,6 +79,9 @@ class IDAssistMCPConfig(BaseSettings):
     # Plugin configuration
     plugin: PluginConfig = Field(default_factory=PluginConfig)
 
+    # Tools that should not be registered with the MCP server
+    disabled_tools: List[str] = Field(default_factory=list, description="List of tool names to disable")
+
     model_config = ConfigDict(
         env_prefix="IDASSISTMCP_",
         env_nested_delimiter="__",
@@ -112,6 +119,23 @@ class IDAssistMCPConfig(BaseSettings):
 
         return errors
 
+    def save_to_file(self, path: Optional[Path] = None):
+        """Save configuration to a JSON file."""
+        path = path or DEFAULT_CONFIG_PATH
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = self.model_dump()
+            # Convert enum values to strings for JSON serialization
+            if "server" in data and "transport" in data["server"]:
+                data["server"]["transport"] = data["server"]["transport"]
+            if "log_level" in data:
+                data["log_level"] = data["log_level"]
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+            log.log_info(f"Configuration saved to {path}")
+        except Exception as e:
+            log.log_error(f"Failed to save config to {path}: {e}")
+
 
 def create_default_config() -> IDAssistMCPConfig:
     """Create a default configuration instance"""
@@ -122,7 +146,6 @@ def load_config_from_file(config_path: Optional[Path] = None) -> IDAssistMCPConf
     """Load configuration from file"""
     if config_path and config_path.exists():
         try:
-            import json
             with open(config_path) as f:
                 config_data = json.load(f)
             return IDAssistMCPConfig(**config_data)

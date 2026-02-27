@@ -20,6 +20,7 @@ try:
     import idc
     import ida_entry
     import ida_funcs
+    import ida_ida
     import ida_nalt
     import ida_name
     import ida_segment
@@ -43,7 +44,6 @@ def register_resources(mcp: FastMCP):
             return {"error": "Not running in IDA"}
 
         try:
-            info = idaapi.get_inf_structure()
             filepath = ida_nalt.get_input_file_path() or ""
             import os
             filename = os.path.basename(filepath)
@@ -54,16 +54,16 @@ def register_resources(mcp: FastMCP):
             entry_count = ida_entry.get_entry_qty()
             import_count = ida_nalt.get_import_module_qty()
 
-            bitness = 64 if info.is_64bit() else (32 if info.is_32bit() else 16)
+            bitness = 64 if ida_ida.inf_is_64bit() else (32 if ida_ida.inf_is_32bit_exactly() else 16)
 
             return {
                 "filename": filename,
                 "filepath": filepath,
-                "architecture": info.procname,
+                "architecture": ida_ida.inf_get_procname(),
                 "bitness": bitness,
-                "entry_point": hex(info.start_ea),
-                "base_address": hex(info.min_ea),
-                "analysis_complete": idaapi.auto_is_ok(),
+                "entry_point": hex(ida_ida.inf_get_start_ea()),
+                "base_address": hex(ida_ida.inf_get_min_ea()),
+                "analysis_complete": not ida_ida.inf_is_auto_enabled(),
                 "statistics": {
                     "functions": func_count,
                     "strings": string_count,
@@ -190,11 +190,10 @@ def register_resources(mcp: FastMCP):
             return {"error": "Not running in IDA"}
 
         try:
-            info = idaapi.get_inf_structure()
             filepath = ida_nalt.get_input_file_path() or ""
             import os
 
-            bitness = 64 if info.is_64bit() else (32 if info.is_32bit() else 16)
+            bitness = 64 if ida_ida.inf_is_64bit() else (32 if ida_ida.inf_is_32bit_exactly() else 16)
 
             # Segments summary
             segments = []
@@ -218,12 +217,12 @@ def register_resources(mcp: FastMCP):
             return {
                 "filename": os.path.basename(filepath),
                 "filepath": filepath,
-                "architecture": info.procname,
+                "architecture": ida_ida.inf_get_procname(),
                 "bitness": bitness,
-                "entry_point": hex(info.start_ea),
-                "min_address": hex(info.min_ea),
-                "max_address": hex(info.max_ea),
-                "file_type": info.filetype,
+                "entry_point": hex(ida_ida.inf_get_start_ea()),
+                "min_address": hex(ida_ida.inf_get_min_ea()),
+                "max_address": hex(ida_ida.inf_get_max_ea()),
+                "file_type": ida_ida.inf_get_filetype(),
                 "segments": segments,
                 "segment_count": len(segments),
             }

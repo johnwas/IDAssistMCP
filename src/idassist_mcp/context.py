@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .logging import log
+from .utils import execute_on_main_thread
 
 try:
     import idaapi
@@ -83,6 +84,8 @@ class IDAContextManager:
     def refresh(self) -> IDABinaryContext:
         """Rebuild context from the current IDB.
 
+        All IDA API calls run on the main thread via execute_on_main_thread.
+
         Returns:
             Updated IDABinaryContext
         """
@@ -95,33 +98,32 @@ class IDAContextManager:
 
         ctx = IDABinaryContext()
 
-        try:
-            # File info
-            ctx.filepath = ida_nalt.get_input_file_path() or ""
-            ctx.filename = os.path.basename(ctx.filepath) if ctx.filepath else ""
+        def _do_refresh():
+            try:
+                # File info
+                ctx.filepath = ida_nalt.get_input_file_path() or ""
+                ctx.filename = os.path.basename(ctx.filepath) if ctx.filepath else ""
 
-            # Hashes
-            ctx.md5 = _get_input_md5()
-            ctx.sha256 = _get_input_sha256()
+                # Hashes
+                ctx.md5 = _get_input_md5()
+                ctx.sha256 = _get_input_sha256()
 
-            # Architecture & platform
-            info = idaapi.get_inf_structure()
-            if info:
-                proc_name = info.procname
+                # Architecture & platform (IDA 9.0+ accessor functions)
+                proc_name = ida_ida.inf_get_procname()
                 ctx.architecture = proc_name if proc_name else "unknown"
 
-                if info.is_64bit():
+                if ida_ida.inf_is_64bit():
                     ctx.bitness = 64
-                elif info.is_32bit():
+                elif ida_ida.inf_is_32bit_exactly():
                     ctx.bitness = 32
                 else:
                     ctx.bitness = 16
 
-                ctx.base_address = info.min_ea
-                ctx.entry_point = info.start_ea
+                ctx.base_address = ida_ida.inf_get_min_ea()
+                ctx.entry_point = ida_ida.inf_get_start_ea()
 
                 # File type
-                ftype = info.filetype
+                ftype = ida_ida.inf_get_filetype()
                 file_type_map = {
                     0: "unknown",
                     1: "ELF",
@@ -142,21 +144,23 @@ class IDAContextManager:
                 else:
                     ctx.platform = ctx.architecture
 
-            # Segments
-            ctx.segments = _get_segments_list()
+                # Segments
+                ctx.segments = _get_segments_list()
 
-            # Counts
-            ctx.function_count = len(list(idautils.Functions()))
-            try:
-                ctx.string_count = sum(1 for _ in idautils.Strings())
-            except Exception:
-                ctx.string_count = 0
+                # Counts
+                ctx.function_count = len(list(idautils.Functions()))
+                try:
+                    ctx.string_count = sum(1 for _ in idautils.Strings())
+                except Exception:
+                    ctx.string_count = 0
 
-            # Analysis state
-            ctx.analysis_complete = idaapi.auto_is_ok()
+                # Analysis state
+                ctx.analysis_complete = not ida_ida.inf_is_auto_enabled()
 
-        except Exception as e:
-            log.log_error(f"Error refreshing IDA context: {e}")
+            except Exception as e:
+                log.log_error(f"Error refreshing IDA context: {e}")
+
+        execute_on_main_thread(_do_refresh)
 
         with self._lock:
             self._context = ctx

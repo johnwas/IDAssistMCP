@@ -2,7 +2,8 @@
 Comprehensive MCP tool implementations for IDAssistMCP
 
 This module provides all 36+ IDA Pro integration tools registered as
-FastMCP tools. All tools that modify the IDB use execute_on_main_thread().
+FastMCP tools. All tools that call IDA APIs use @_ida_main_thread to dispatch
+onto IDA's main thread (required for both reads and writes).
 """
 
 import functools
@@ -31,11 +32,11 @@ try:
     import ida_entry
     import ida_funcs
     import ida_hexrays
+    import ida_ida
     import ida_kernwin
     import ida_lines
     import ida_name
     import ida_nalt
-    import ida_search
     import ida_segment
     import ida_typeinf
     import ida_xref
@@ -63,8 +64,64 @@ def _resolve(name_or_addr: str) -> int:
 # Tool registration entry-point (called from server.py)
 # --------------------------------------------------------------------------- #
 
-def register_tools(mcp: FastMCP):
-    """Register all MCP tools on the given FastMCP instance."""
+def register_tools(mcp: FastMCP, disabled_tools=None):
+    """Register all MCP tools on the given FastMCP instance.
+
+    Args:
+        mcp: FastMCP server instance
+        disabled_tools: Optional set/list of tool names to skip registration
+    """
+    if disabled_tools is None:
+        disabled_tools = set()
+    else:
+        disabled_tools = set(disabled_tools)
+
+    def _tool(name, **kwargs):
+        """Conditionally apply @mcp.tool() decorator, skipping disabled tools.
+        Wraps the tool function with invocation logging."""
+        if name in disabled_tools:
+            log.log_info(f"Tool '{name}' is disabled, skipping registration")
+            return lambda fn: fn  # no-op decorator
+
+        real_decorator = mcp.tool(**kwargs)
+
+        def logging_decorator(fn):
+            @functools.wraps(fn)
+            def wrapper(*args, **kw):
+                log.log_info(f"Tool called: {name}")
+                return fn(*args, **kw)
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args, **kw):
+                log.log_info(f"Tool called: {name}")
+                return await fn(*args, **kw)
+
+            import asyncio
+            wrapped = async_wrapper if asyncio.iscoroutinefunction(fn) else wrapper
+            return real_decorator(wrapped)
+
+        return logging_decorator
+
+    def _ida_main_thread(fn):
+        """Decorator: run entire function body on IDA's main thread.
+
+        IDA requires many API calls (reads AND writes) to happen on the
+        main thread.  The MCP server runs on a background thread, so all
+        tool functions that call IDA APIs must be dispatched.
+        """
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            holder = [None, None]          # [result, exception]
+            def _do():
+                try:
+                    holder[0] = fn(*args, **kwargs)
+                except Exception as e:
+                    holder[1] = e
+            execute_on_main_thread(_do)
+            if holder[1] is not None:
+                raise holder[1]
+            return holder[0]
+        return wrapper
 
     # Tool annotations for MCP 2025-11-25 compliance
     READ_ONLY = {
@@ -87,7 +144,7 @@ def register_tools(mcp: FastMCP):
     #  1-2. Binary Management
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("list_binaries", annotations=READ_ONLY)
     def list_binaries(ctx: Context) -> dict:
         """List the currently loaded binary (IDA is single-binary).
 
@@ -102,7 +159,7 @@ def register_tools(mcp: FastMCP):
             "count": 1,
         }
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_binary_info", annotations=READ_ONLY)
     def get_binary_info(ctx: Context) -> dict:
         """Get detailed information about the currently loaded binary.
 
@@ -117,7 +174,8 @@ def register_tools(mcp: FastMCP):
     #  3-7. Code Analysis
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("decompile_function", annotations=READ_ONLY)
+    @_ida_main_thread
     def decompile_function(function_name_or_address: str, ctx: Context) -> dict:
         """Decompile a function using Hex-Rays.
 
@@ -146,7 +204,8 @@ def register_tools(mcp: FastMCP):
         except Exception as e:
             return {"error": f"Decompilation error: {e}"}
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_disassembly", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_disassembly(function_name_or_address: str, ctx: Context) -> dict:
         """Get disassembly listing for a function.
 
@@ -174,7 +233,8 @@ def register_tools(mcp: FastMCP):
             "instruction_count": len(lines),
         }
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_function_info", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_function_info(function_name_or_address: str, ctx: Context) -> dict:
         """Get metadata about a function.
 
@@ -210,7 +270,8 @@ def register_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_basic_blocks", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_basic_blocks(function_name_or_address: str, ctx: Context) -> list:
         """Get basic blocks (CFG) for a function.
 
@@ -240,7 +301,7 @@ def register_tools(mcp: FastMCP):
 
         return blocks
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_il_expression", annotations=READ_ONLY)
     def get_il_expression(function_name_or_address: str, ctx: Context) -> dict:
         """Get pseudo-C (Hex-Rays) output for a function.
 
@@ -259,7 +320,8 @@ def register_tools(mcp: FastMCP):
     #  8. Cross-References
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_xrefs", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_xrefs(address_or_name: str, ctx: Context, direction: str = "both") -> dict:
         """Get cross-references to/from an address.
 
@@ -303,7 +365,8 @@ def register_tools(mcp: FastMCP):
     #  9. Comments
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_comments", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_comments(function_name_or_address: str, ctx: Context) -> dict:
         """Get comments for a function (regular, repeatable, and function-level).
 
@@ -343,7 +406,8 @@ def register_tools(mcp: FastMCP):
     #  10. Variables
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_variables", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_variables(function_name_or_address: str, ctx: Context) -> dict:
         """Get local variables for a function via Hex-Rays decompiler.
 
@@ -384,7 +448,8 @@ def register_tools(mcp: FastMCP):
     #  11. Types
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_types", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_types(ctx: Context, filter: str = "") -> dict:
         """List local types (structs, enums, typedefs) in the IDB.
 
@@ -431,7 +496,8 @@ def register_tools(mcp: FastMCP):
     #  12-16. Function Discovery
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("list_functions", annotations=READ_ONLY)
+    @_ida_main_thread
     def list_functions(ctx: Context, filter: str = "", limit: int = 200,
                        offset: int = 0) -> dict:
         """List all functions in the binary with optional filtering and pagination.
@@ -468,7 +534,8 @@ def register_tools(mcp: FastMCP):
             "returned": len(page),
         }
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("search_functions", annotations=READ_ONLY)
+    @_ida_main_thread
     def search_functions(search_term: str, ctx: Context,
                          min_size: int = 0, max_size: int = 0,
                          limit: int = 100) -> list:
@@ -508,7 +575,8 @@ def register_tools(mcp: FastMCP):
 
         return results
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_function_by_name", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_function_by_name(name: str, ctx: Context) -> dict:
         """Look up a function by its exact name.
 
@@ -533,7 +601,8 @@ def register_tools(mcp: FastMCP):
             "size": func.end_ea - func.start_ea,
         }
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_function_by_address", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_function_by_address(address: str, ctx: Context) -> dict:
         """Look up a function containing the given address.
 
@@ -558,7 +627,8 @@ def register_tools(mcp: FastMCP):
             "size": func.end_ea - func.start_ea,
         }
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_callers_callees", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_callers_callees(function_name_or_address: str, ctx: Context) -> dict:
         """Get the call graph (callers and callees) for a function.
 
@@ -611,7 +681,8 @@ def register_tools(mcp: FastMCP):
     #  17-20. Binary Info
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_imports", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_imports(ctx: Context) -> dict:
         """Get imported functions grouped by module.
 
@@ -642,7 +713,8 @@ def register_tools(mcp: FastMCP):
             "total_imports": sum(len(v) for v in imports_by_module.values()),
         }
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_exports", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_exports(ctx: Context) -> dict:
         """Get exported symbols.
 
@@ -662,7 +734,8 @@ def register_tools(mcp: FastMCP):
 
         return {"exports": exports, "count": len(exports)}
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_strings", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_strings(ctx: Context, min_length: int = 4, page_size: int = 100,
                     page_number: int = 1) -> dict:
         """Get strings found in the binary with pagination.
@@ -699,7 +772,8 @@ def register_tools(mcp: FastMCP):
             "total_pages": total_pages,
         }
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_segments", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_segments(ctx: Context) -> list:
         """Get memory segments.
 
@@ -735,7 +809,8 @@ def register_tools(mcp: FastMCP):
     #  21-23. Symbol Management (Modify)
     # ================================================================== #
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("rename_function", annotations=MODIFY)
+    @_ida_main_thread
     def rename_function(address_or_name: str, new_name: str, ctx: Context) -> str:
         """Rename a function in the IDB.
 
@@ -752,19 +827,13 @@ def register_tools(mcp: FastMCP):
             return f"No function at {hex(ea)}"
 
         old_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
-        result_holder = [False]
-
-        def _do():
-            result_holder[0] = ida_name.set_name(func.start_ea, new_name, ida_name.SN_CHECK)
-
-        execute_on_main_thread(_do)
-
-        if result_holder[0]:
+        if ida_name.set_name(func.start_ea, new_name, ida_name.SN_CHECK):
             return f"Renamed '{old_name}' to '{new_name}'"
         else:
             return f"Failed to rename function to '{new_name}'"
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("rename_variable", annotations=MODIFY)
+    @_ida_main_thread
     def rename_variable(function_address: str, old_name: str, new_name: str,
                         ctx: Context) -> str:
         """Rename a local variable in a decompiled function.
@@ -781,40 +850,30 @@ def register_tools(mcp: FastMCP):
         if func_ea is None:
             return f"Invalid address: {function_address}"
 
-        result_holder = [False, ""]
+        try:
+            cfunc = ida_hexrays.decompile(func_ea)
+            if not cfunc:
+                return "Failed: Decompilation failed"
 
-        def _do():
-            try:
-                cfunc = ida_hexrays.decompile(func_ea)
-                if not cfunc:
-                    result_holder[1] = "Decompilation failed"
-                    return
+            lvars = cfunc.get_lvars()
+            target = None
+            for lvar in lvars:
+                if lvar.name == old_name:
+                    target = lvar
+                    break
 
-                lvars = cfunc.get_lvars()
-                target = None
-                for lvar in lvars:
-                    if lvar.name == old_name:
-                        target = lvar
-                        break
+            if not target:
+                return f"Failed: Variable '{old_name}' not found"
 
-                if not target:
-                    result_holder[1] = f"Variable '{old_name}' not found"
-                    return
+            if ida_hexrays.rename_lvar(cfunc, target, new_name):
+                return f"Renamed variable '{old_name}' to '{new_name}'"
+            else:
+                return "Failed: rename_lvar failed"
+        except Exception as e:
+            return f"Failed: {e}"
 
-                result_holder[0] = ida_hexrays.rename_lvar(cfunc, target, new_name)
-                if not result_holder[0]:
-                    result_holder[1] = "rename_lvar failed"
-            except Exception as e:
-                result_holder[1] = str(e)
-
-        execute_on_main_thread(_do)
-
-        if result_holder[0]:
-            return f"Renamed variable '{old_name}' to '{new_name}'"
-        else:
-            return f"Failed: {result_holder[1]}"
-
-    @mcp.tool(annotations=MODIFY)
+    @_tool("set_type", annotations=MODIFY)
+    @_ida_main_thread
     def set_type(address: str, type_string: str, ctx: Context) -> str:
         """Set the type of a function or variable at the given address.
 
@@ -829,34 +888,25 @@ def register_tools(mcp: FastMCP):
         if ea is None:
             return f"Invalid address: {address}"
 
-        result_holder = [False, ""]
-
-        def _do():
-            try:
-                tif = ida_typeinf.tinfo_t()
-                til = ida_typeinf.get_idati()
-                if ida_typeinf.parse_decl(tif, til, type_string, ida_typeinf.PT_SIL):
-                    if ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
-                        result_holder[0] = True
-                    else:
-                        result_holder[1] = "apply_tinfo failed"
+        try:
+            tif = ida_typeinf.tinfo_t()
+            til = ida_typeinf.get_idati()
+            if ida_typeinf.parse_decl(tif, til, type_string, ida_typeinf.PT_SIL):
+                if ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
+                    return f"Set type at {hex(ea)} to '{type_string}'"
                 else:
-                    result_holder[1] = f"Could not parse type: {type_string}"
-            except Exception as e:
-                result_holder[1] = str(e)
-
-        execute_on_main_thread(_do)
-
-        if result_holder[0]:
-            return f"Set type at {hex(ea)} to '{type_string}'"
-        else:
-            return f"Failed: {result_holder[1]}"
+                    return "Failed: apply_tinfo failed"
+            else:
+                return f"Failed: Could not parse type: {type_string}"
+        except Exception as e:
+            return f"Failed: {e}"
 
     # ================================================================== #
     #  24. Set Comment (Modify)
     # ================================================================== #
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("set_comment", annotations=MODIFY)
+    @_ida_main_thread
     def set_comment(address: str, text: str, ctx: Context,
                     comment_type: str = "regular") -> str:
         """Set a comment at an address.
@@ -873,18 +923,12 @@ def register_tools(mcp: FastMCP):
         if ea is None:
             return f"Invalid address: {address}"
 
-        result_holder = [False]
-
-        def _do():
-            if comment_type == "function":
-                idc.set_func_cmt(ea, text, 0)
-            elif comment_type == "repeatable":
-                idc.set_cmt(ea, text, 1)
-            else:
-                idc.set_cmt(ea, text, 0)
-            result_holder[0] = True
-
-        execute_on_main_thread(_do)
+        if comment_type == "function":
+            idc.set_func_cmt(ea, text, 0)
+        elif comment_type == "repeatable":
+            idc.set_cmt(ea, text, 1)
+        else:
+            idc.set_cmt(ea, text, 0)
 
         return f"Set {comment_type} comment at {hex(ea)}"
 
@@ -892,7 +936,8 @@ def register_tools(mcp: FastMCP):
     #  25-28. Data Analysis (Modify)
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("read_memory", annotations=READ_ONLY)
+    @_ida_main_thread
     def read_memory(address: str, size: int, ctx: Context) -> dict:
         """Read raw bytes from the IDB at a given address.
 
@@ -919,7 +964,8 @@ def register_tools(mcp: FastMCP):
             "printable": "".join(chr(b) if 32 <= b < 127 else "." for b in data),
         }
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("create_struct", annotations=MODIFY)
+    @_ida_main_thread
     def create_struct(name: str, members: list, ctx: Context) -> str:
         """Create a new struct type in the IDB.
 
@@ -931,43 +977,34 @@ def register_tools(mcp: FastMCP):
         Returns:
             Success or failure message.
         """
-        result_holder = [False, ""]
+        try:
+            udt = ida_typeinf.udt_type_data_t()
 
-        def _do():
-            try:
-                udt = ida_typeinf.udt_type_data_t()
+            for member in members:
+                udm = ida_typeinf.udt_member_t()
+                udm.name = member["name"]
 
-                for member in members:
-                    udm = ida_typeinf.udt_member_t()
-                    udm.name = member["name"]
+                mtif = ida_typeinf.tinfo_t()
+                til = ida_typeinf.get_idati()
+                type_str = member.get("type", "int")
+                if not ida_typeinf.parse_decl(mtif, til, f"{type_str} x;", ida_typeinf.PT_SIL):
+                    # Fallback to byte array
+                    msize = member.get("size", 4)
+                    mtif.create_array(ida_typeinf.tinfo_t(ida_typeinf.BT_INT8), msize)
 
-                    mtif = ida_typeinf.tinfo_t()
-                    til = ida_typeinf.get_idati()
-                    type_str = member.get("type", "int")
-                    if not ida_typeinf.parse_decl(mtif, til, f"{type_str} x;", ida_typeinf.PT_SIL):
-                        # Fallback to byte array
-                        msize = member.get("size", 4)
-                        mtif.create_array(ida_typeinf.tinfo_t(ida_typeinf.BT_INT8), msize)
+                udm.type = mtif
+                udm.size = mtif.get_size() * 8  # size in bits
+                udt.push_back(udm)
 
-                    udm.type = mtif
-                    udm.size = mtif.get_size() * 8  # size in bits
-                    udt.push_back(udm)
-
-                tif = ida_typeinf.tinfo_t()
-                tif.create_udt(udt, ida_typeinf.BTF_STRUCT)
-                tif.set_named_type(ida_typeinf.get_idati(), name)
-                result_holder[0] = True
-            except Exception as e:
-                result_holder[1] = str(e)
-
-        execute_on_main_thread(_do)
-
-        if result_holder[0]:
+            tif = ida_typeinf.tinfo_t()
+            tif.create_udt(udt, ida_typeinf.BTF_STRUCT)
+            tif.set_named_type(ida_typeinf.get_idati(), name)
             return f"Created struct '{name}' with {len(members)} members"
-        else:
-            return f"Failed to create struct: {result_holder[1]}"
+        except Exception as e:
+            return f"Failed to create struct: {e}"
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("create_enum", annotations=MODIFY)
+    @_ida_main_thread
     def create_enum(name: str, members: dict, ctx: Context,
                     bitfield: bool = False) -> str:
         """Create a new enum type in the IDB.
@@ -980,35 +1017,26 @@ def register_tools(mcp: FastMCP):
         Returns:
             Success or failure message.
         """
-        result_holder = [False, ""]
+        try:
+            edt = ida_typeinf.enum_type_data_t()
+            for mname, mval in members.items():
+                em = ida_typeinf.edm_t()
+                em.name = mname
+                em.value = mval
+                edt.push_back(em)
 
-        def _do():
-            try:
-                edt = ida_typeinf.enum_type_data_t()
-                for mname, mval in members.items():
-                    em = ida_typeinf.edm_t()
-                    em.name = mname
-                    em.value = mval
-                    edt.push_back(em)
+            if bitfield:
+                edt.bte |= ida_typeinf.BTE_BITFIELD
 
-                if bitfield:
-                    edt.bte |= ida_typeinf.BTE_BITFIELD
-
-                tif = ida_typeinf.tinfo_t()
-                tif.create_enum(edt)
-                tif.set_named_type(ida_typeinf.get_idati(), name)
-                result_holder[0] = True
-            except Exception as e:
-                result_holder[1] = str(e)
-
-        execute_on_main_thread(_do)
-
-        if result_holder[0]:
+            tif = ida_typeinf.tinfo_t()
+            tif.create_enum(edt)
+            tif.set_named_type(ida_typeinf.get_idati(), name)
             return f"Created enum '{name}' with {len(members)} members"
-        else:
-            return f"Failed to create enum: {result_holder[1]}"
+        except Exception as e:
+            return f"Failed to create enum: {e}"
 
-    @mcp.tool(annotations=NON_IDEMPOTENT)
+    @_tool("patch_bytes", annotations=NON_IDEMPOTENT)
+    @_ida_main_thread
     def patch_bytes(address: str, hex_bytes: str, ctx: Context) -> str:
         """Patch bytes in the IDB at a given address.
 
@@ -1030,24 +1058,15 @@ def register_tools(mcp: FastMCP):
         except ValueError:
             return f"Invalid hex string: {hex_bytes}"
 
-        result_holder = [False]
-
-        def _do():
-            ida_bytes.patch_bytes(ea, data)
-            result_holder[0] = True
-
-        execute_on_main_thread(_do)
-
-        if result_holder[0]:
-            return f"Patched {len(data)} bytes at {hex(ea)}"
-        else:
-            return f"Failed to patch bytes at {hex(ea)}"
+        ida_bytes.patch_bytes(ea, data)
+        return f"Patched {len(data)} bytes at {hex(ea)}"
 
     # ================================================================== #
     #  29-30. Navigation (Modify)
     # ================================================================== #
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("navigate_to", annotations=MODIFY)
+    @_ida_main_thread
     def navigate_to(address: str, ctx: Context) -> str:
         """Move IDA cursor to a specific address.
 
@@ -1061,19 +1080,13 @@ def register_tools(mcp: FastMCP):
         if ea is None:
             return f"Invalid address: {address}"
 
-        result_holder = [False]
-
-        def _do():
-            result_holder[0] = ida_kernwin.jumpto(ea)
-
-        execute_on_main_thread(_do)
-
-        if result_holder[0]:
+        if ida_kernwin.jumpto(ea):
             return f"Navigated to {hex(ea)}"
         else:
             return f"Failed to navigate to {hex(ea)}"
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("set_bookmark", annotations=MODIFY)
+    @_ida_main_thread
     def set_bookmark(address: str, description: str, ctx: Context,
                      slot: int = 0) -> str:
         """Create a position bookmark in IDA.
@@ -1090,21 +1103,14 @@ def register_tools(mcp: FastMCP):
         if ea is None:
             return f"Invalid address: {address}"
 
-        result_holder = [False]
-
-        def _do():
-            idc.put_bookmark(ea, 0, 0, 0, slot, description)
-            result_holder[0] = True
-
-        execute_on_main_thread(_do)
-
+        idc.put_bookmark(ea, 0, 0, 0, slot, description)
         return f"Bookmark set at {hex(ea)} (slot {slot}): {description}"
 
     # ================================================================== #
     #  31-33. Task Management
     # ================================================================== #
 
-    @mcp.tool(annotations=NON_IDEMPOTENT)
+    @_tool("start_task", annotations=NON_IDEMPOTENT)
     async def start_task(name: str, tool_name: str, ctx: Context, **kwargs) -> dict:
         """Start an async background task.
 
@@ -1123,7 +1129,7 @@ def register_tools(mcp: FastMCP):
         task_id = await task_manager.submit(_run, name=name)
         return {"task_id": task_id, "status": "submitted"}
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_task_status", annotations=READ_ONLY)
     def get_task_status(task_id: str, ctx: Context) -> dict:
         """Get status of an async task.
 
@@ -1136,7 +1142,7 @@ def register_tools(mcp: FastMCP):
         task_manager = get_task_manager()
         return task_manager.get_task_status(task_id)
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("cancel_task", annotations=MODIFY)
     def cancel_task(task_id: str, ctx: Context) -> dict:
         """Cancel a running async task.
 
@@ -1158,7 +1164,8 @@ def register_tools(mcp: FastMCP):
     #  34. Get data at address
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_data_at", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_data_at(address: str, ctx: Context, size: int = 0) -> dict:
         """Get typed data at a specific address.
 
@@ -1209,7 +1216,8 @@ def register_tools(mcp: FastMCP):
     #  35. Search bytes
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("search_bytes", annotations=READ_ONLY)
+    @_ida_main_thread
     def search_bytes(pattern: str, ctx: Context, start_address: str = "",
                      max_results: int = 100) -> list:
         """Search for a byte pattern in the binary.
@@ -1235,13 +1243,17 @@ def register_tools(mcp: FastMCP):
             if start_ea is None:
                 return [{"error": f"Invalid start address: {start_address}"}]
         else:
-            start_ea = idaapi.get_inf_structure().min_ea
+            start_ea = ida_ida.inf_get_min_ea()
+
+        # Compile the binary pattern once
+        compiled = ida_bytes.compiled_binpat_vec_t()
+        ida_bytes.parse_binpat_str(compiled, start_ea, search_pattern, 16)
 
         results = []
         ea = start_ea
         for _ in range(max_results):
-            ea = ida_search.find_binary(ea, idaapi.BADADDR, search_pattern,
-                                        16, ida_search.SEARCH_DOWN | ida_search.SEARCH_NEXT)
+            ea = ida_bytes.bin_search(ea, idaapi.BADADDR, compiled,
+                                      ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOBREAK)
             if ea == idaapi.BADADDR:
                 break
 
@@ -1260,7 +1272,8 @@ def register_tools(mcp: FastMCP):
     #  36. Get entry points
     # ================================================================== #
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_entry_points", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_entry_points(ctx: Context) -> list:
         """Get all binary entry points.
 
@@ -1283,7 +1296,8 @@ def register_tools(mcp: FastMCP):
     #  Additional tools for parity with BinAssistMCP
     # ================================================================== #
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("rename_symbol", annotations=MODIFY)
+    @_ida_main_thread
     def rename_symbol(address_or_name: str, new_name: str, ctx: Context) -> str:
         """Rename any symbol (function or data) at the given address/name.
 
@@ -1296,19 +1310,13 @@ def register_tools(mcp: FastMCP):
         """
         ea = _resolve(address_or_name)
         old_name = ida_name.get_name(ea) or f"loc_{ea:x}"
-        result_holder = [False]
-
-        def _do():
-            result_holder[0] = ida_name.set_name(ea, new_name, ida_name.SN_CHECK)
-
-        execute_on_main_thread(_do)
-
-        if result_holder[0]:
+        if ida_name.set_name(ea, new_name, ida_name.SN_CHECK):
             return f"Renamed '{old_name}' to '{new_name}'"
         else:
             return f"Failed to rename to '{new_name}'"
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_function_statistics", annotations=READ_ONLY)
+    @_ida_main_thread
     def get_function_statistics(ctx: Context) -> dict:
         """Get comprehensive statistics about all functions in the binary.
 
@@ -1345,7 +1353,8 @@ def register_tools(mcp: FastMCP):
             "top_10_largest": top_10,
         }
 
-    @mcp.tool(annotations=MODIFY)
+    @_tool("batch_rename", annotations=MODIFY)
+    @_ida_main_thread
     def batch_rename(renames: list, ctx: Context) -> list:
         """Batch rename multiple symbols.
 
@@ -1366,26 +1375,21 @@ def register_tools(mcp: FastMCP):
             try:
                 ea = _resolve(addr_or_name)
                 old_name = ida_name.get_name(ea) or f"loc_{ea:x}"
-
-                success_holder = [False]
-
-                def _do(target_ea=ea, target_name=new_name):
-                    success_holder[0] = ida_name.set_name(target_ea, target_name, ida_name.SN_CHECK)
-
-                execute_on_main_thread(_do)
+                success = ida_name.set_name(ea, new_name, ida_name.SN_CHECK)
 
                 results.append({
                     "address": hex(ea),
                     "old_name": old_name,
                     "new_name": new_name,
-                    "success": success_holder[0],
+                    "success": success,
                 })
             except Exception as e:
                 results.append({"address_or_name": addr_or_name, "success": False, "error": str(e)})
 
         return results
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("search_strings", annotations=READ_ONLY)
+    @_ida_main_thread
     def search_strings(pattern: str, ctx: Context, case_sensitive: bool = False,
                        page_size: int = 100, page_number: int = 1) -> dict:
         """Search for strings matching a pattern with pagination.
@@ -1425,7 +1429,7 @@ def register_tools(mcp: FastMCP):
             "total_pages": total_pages,
         }
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("get_code", annotations=READ_ONLY)
     def get_code(function_name_or_address: str, ctx: Context,
                  format: str = "decompile") -> dict:
         """Get function code in specified format (unified tool).
@@ -1442,7 +1446,8 @@ def register_tools(mcp: FastMCP):
         else:
             return decompile_function(function_name_or_address, ctx)
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("analyze_function", annotations=READ_ONLY)
+    @_ida_main_thread
     def analyze_function(function_name_or_address: str, ctx: Context) -> dict:
         """Perform comprehensive analysis of a function.
 
@@ -1506,7 +1511,7 @@ def register_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool(annotations=READ_ONLY)
+    @_tool("list_tasks", annotations=READ_ONLY)
     def list_tasks(ctx: Context, status: str = "") -> list:
         """List all async tasks, optionally filtered by status.
 
@@ -1525,4 +1530,7 @@ def register_tools(mcp: FastMCP):
                 pass
         return task_manager.list_tasks(status_filter)
 
-    log.log_info(f"Registered all MCP tools")
+    if disabled_tools:
+        log.log_info(f"Registered MCP tools ({len(disabled_tools)} disabled)")
+    else:
+        log.log_info(f"Registered all MCP tools")

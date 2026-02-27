@@ -5,18 +5,16 @@ This is the IDA plugin_t that manages the IDAssistMCP MCP server lifecycle.
 Place this file (or a symlink to it) in your IDA Pro plugins/ directory.
 
 The plugin starts/stops a standalone MCP server that exposes IDA Pro's
-analysis capabilities (36+ tools, 8 resources, 7 prompts) via the Model
+analysis capabilities (43 tools, 8 resources, 7 prompts) via the Model
 Context Protocol over SSE or Streamable HTTP transport.
 
 Usage:
     - The plugin loads automatically when IDA starts.
     - Press Ctrl+Shift+M (or use Edit > Plugins > IDAssistMCP) to toggle
       the MCP server on/off.
+    - Press Ctrl+Shift+N to open the configuration panel.
     - The server endpoint URL is printed to IDA's output window on start.
-    - Configure via environment variables with IDASSISTMCP_ prefix:
-        IDASSISTMCP_SERVER__HOST=0.0.0.0
-        IDASSISTMCP_SERVER__PORT=9080
-        IDASSISTMCP_SERVER__TRANSPORT=streamablehttp   (or sse)
+    - Configure via the config panel or environment variables (IDASSISTMCP_ prefix).
 """
 
 import os
@@ -45,7 +43,7 @@ class IDAssistMCPPlugin(idaapi.plugin_t):
 
     flags = idaapi.PLUGIN_KEEP
     comment = "IDAssistMCP - MCP server for LLM-powered reverse engineering"
-    help = "Toggle MCP server with Ctrl+Shift+M"
+    help = "Toggle MCP server with Ctrl+Shift+M, open config with Ctrl+Shift+N"
     wanted_name = "IDAssistMCP"
     wanted_hotkey = "Ctrl-Shift-M"
 
@@ -54,10 +52,35 @@ class IDAssistMCPPlugin(idaapi.plugin_t):
         self._server = None
         self._config = None
 
-        ida_kernwin.msg("[IDAssistMCP] Plugin loaded. Press Ctrl+Shift+M to start/stop the MCP server.\n")
+        # Load persistent config from file (falls back to defaults)
+        try:
+            from idassist_mcp.config import load_config_from_file, DEFAULT_CONFIG_PATH
+            self._config = load_config_from_file(DEFAULT_CONFIG_PATH)
+        except Exception as e:
+            ida_kernwin.msg(f"[IDAssistMCP] Config load error, using defaults: {e}\n")
 
-        # Register menu action
+        ida_kernwin.msg("[IDAssistMCP] Plugin loaded. "
+                        "Ctrl+Shift+M=toggle server, Ctrl+Shift+N=config panel\n")
+
+        # Register menu actions
         self._register_menu_action()
+        self._register_config_action()
+
+        # Auto-startup if configured
+        if self._config and self._config.plugin.auto_startup:
+            ida_kernwin.msg("[IDAssistMCP] Auto-starting server...\n")
+            self._start_server()
+
+        # Open config panel after UI is ready (one-shot timer)
+        def _open_panel():
+            try:
+                from idassist_mcp.ui.config_panel import IDAssistMCPPanel
+                IDAssistMCPPanel.open(self)
+            except Exception as e:
+                ida_kernwin.msg(f"[IDAssistMCP] Failed to open config panel: {e}\n")
+            return -1  # negative = don't repeat
+
+        idaapi.register_timer(500, _open_panel)
 
         return idaapi.PLUGIN_KEEP
 
@@ -76,6 +99,7 @@ class IDAssistMCPPlugin(idaapi.plugin_t):
             self._server = None
 
         self._unregister_menu_action()
+        self._unregister_config_action()
         ida_kernwin.msg("[IDAssistMCP] Plugin unloaded.\n")
 
     # --------------------------------------------------------------------- #
@@ -92,8 +116,9 @@ class IDAssistMCPPlugin(idaapi.plugin_t):
             # Suppress noisy external loggers
             disable_external_logging()
 
-            # Load configuration (reads IDASSISTMCP_ env vars)
-            self._config = IDAssistMCPConfig()
+            # Use persistent config if available, otherwise create from env
+            if self._config is None:
+                self._config = IDAssistMCPConfig()
 
             ida_kernwin.msg(f"[IDAssistMCP] Starting MCP server on "
                             f"{self._config.server.host}:{self._config.server.port} "
@@ -136,6 +161,7 @@ class IDAssistMCPPlugin(idaapi.plugin_t):
     # --------------------------------------------------------------------- #
 
     ACTION_NAME = "idassistmcp:toggle_server"
+    CONFIG_ACTION_NAME = "idassistmcp:open_config"
     MENU_PATH = "Edit/Plugins/"
 
     def _register_menu_action(self):
@@ -161,6 +187,29 @@ class IDAssistMCPPlugin(idaapi.plugin_t):
         idaapi.detach_action_from_menu(self.MENU_PATH, self.ACTION_NAME)
         idaapi.unregister_action(self.ACTION_NAME)
 
+    def _register_config_action(self):
+        """Register the config panel action in IDA's menu."""
+        action_desc = idaapi.action_desc_t(
+            self.CONFIG_ACTION_NAME,
+            "IDAssistMCP: Configuration Panel",
+            _OpenConfigPanelHandler(self),
+            "Ctrl-Shift-N",
+            "Open the IDAssistMCP configuration panel",
+            -1,  # icon
+        )
+
+        if idaapi.register_action(action_desc):
+            idaapi.attach_action_to_menu(
+                self.MENU_PATH,
+                self.CONFIG_ACTION_NAME,
+                idaapi.SETMENU_APP,
+            )
+
+    def _unregister_config_action(self):
+        """Remove the config panel action from IDA's menu."""
+        idaapi.detach_action_from_menu(self.MENU_PATH, self.CONFIG_ACTION_NAME)
+        idaapi.unregister_action(self.CONFIG_ACTION_NAME)
+
 
 class _ToggleServerHandler(idaapi.action_handler_t):
     """Action handler that delegates to the plugin's run() method."""
@@ -171,6 +220,27 @@ class _ToggleServerHandler(idaapi.action_handler_t):
 
     def activate(self, ctx):
         self._plugin.run()
+        return 1
+
+    def update(self, ctx):
+        return idaapi.AST_ENABLE_ALWAYS
+
+
+class _OpenConfigPanelHandler(idaapi.action_handler_t):
+    """Action handler that opens the configuration panel."""
+
+    def __init__(self, plugin: IDAssistMCPPlugin):
+        super().__init__()
+        self._plugin = plugin
+
+    def activate(self, ctx):
+        try:
+            from idassist_mcp.ui.config_panel import IDAssistMCPPanel
+            IDAssistMCPPanel.open(self._plugin)
+        except Exception as e:
+            ida_kernwin.msg(f"[IDAssistMCP] Failed to open config panel: {e}\n")
+            import traceback
+            ida_kernwin.msg(f"[IDAssistMCP] {traceback.format_exc()}\n")
         return 1
 
     def update(self, ctx):
