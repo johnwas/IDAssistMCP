@@ -1,9 +1,12 @@
 """
 Comprehensive MCP tool implementations for IDAssistMCP
 
-This module provides all 36+ IDA Pro integration tools registered as
+This module provides 38 IDA Pro integration tools registered as
 FastMCP tools. All tools that call IDA APIs use @_ida_main_thread to dispatch
 onto IDA's main thread (required for both reads and writes).
+
+Consolidated tools (5): get_code, comments_tool, variables_tool, types_tool, xrefs_tool
+Standalone tools (33): see register_tools() for the full list
 """
 
 import functools
@@ -141,6 +144,53 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
     }
 
     # ================================================================== #
+    #  Internal helpers (not registered as tools)
+    # ================================================================== #
+
+    @_ida_main_thread
+    def _decompile_function_impl(function_name_or_address: str) -> dict:
+        """Internal: decompile a function using Hex-Rays."""
+        ea = _resolve(function_name_or_address)
+        func = ida_funcs.get_func(ea)
+        if not func:
+            return {"error": f"No function at {hex(ea)}"}
+
+        try:
+            cfunc = ida_hexrays.decompile(func.start_ea)
+            if not cfunc:
+                return {"error": f"Decompilation failed for {hex(ea)}"}
+
+            func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
+            return {
+                "function": func_name,
+                "address": hex(func.start_ea),
+                "code": str(cfunc),
+            }
+        except Exception as e:
+            return {"error": f"Decompilation error: {e}"}
+
+    @_ida_main_thread
+    def _get_disassembly_impl(function_name_or_address: str) -> dict:
+        """Internal: get disassembly listing for a function."""
+        ea = _resolve(function_name_or_address)
+        func = ida_funcs.get_func(ea)
+        if not func:
+            return {"error": f"No function at {hex(ea)}"}
+
+        func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
+        lines = []
+        for item_ea in idautils.FuncItems(func.start_ea):
+            disasm = idc.generate_disasm_line(item_ea, 0)
+            lines.append(f"0x{item_ea:08x}  {disasm}")
+
+        return {
+            "function": func_name,
+            "address": hex(func.start_ea),
+            "disassembly": "\n".join(lines),
+            "instruction_count": len(lines),
+        }
+
+    # ================================================================== #
     #  1-2. Binary Management
     # ================================================================== #
 
@@ -171,78 +221,43 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
         return cm.get_context().to_dict()
 
     # ================================================================== #
-    #  3-7. Code Analysis
+    #  3. get_code (consolidated — absorbs decompile/disasm/il_expression)
     # ================================================================== #
 
-    @_tool("decompile_function", annotations=READ_ONLY)
-    @_ida_main_thread
-    def decompile_function(function_name_or_address: str, ctx: Context) -> dict:
-        """Decompile a function using Hex-Rays.
+    @_tool("get_code", annotations=READ_ONLY)
+    def get_code(function_name_or_address: str, ctx: Context,
+                 format: str = "decompile") -> dict:
+        """Get function code in specified format (unified tool).
 
         Args:
-            function_name_or_address: Function name or hex address (e.g. '0x401000')
+            function_name_or_address: Function identifier (name or hex address)
+            format: Output format - 'decompile' for pseudo-C or 'disasm' for assembly
 
         Returns:
-            Dictionary with function name, address, and decompiled pseudo-C code.
+            Dictionary with function info and code.
         """
-        ea = _resolve(function_name_or_address)
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return {"error": f"No function at {hex(ea)}"}
+        if format == "disasm":
+            return _get_disassembly_impl(function_name_or_address)
+        else:
+            return _decompile_function_impl(function_name_or_address)
 
-        try:
-            cfunc = ida_hexrays.decompile(func.start_ea)
-            if not cfunc:
-                return {"error": f"Decompilation failed for {hex(ea)}"}
+    # ================================================================== #
+    #  4. analyze_function (comprehensive — absorbs get_function_info)
+    # ================================================================== #
 
-            func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
-            return {
-                "function": func_name,
-                "address": hex(func.start_ea),
-                "code": str(cfunc),
-            }
-        except Exception as e:
-            return {"error": f"Decompilation error: {e}"}
-
-    @_tool("get_disassembly", annotations=READ_ONLY)
+    @_tool("analyze_function", annotations=READ_ONLY)
     @_ida_main_thread
-    def get_disassembly(function_name_or_address: str, ctx: Context) -> dict:
-        """Get disassembly listing for a function.
+    def analyze_function(function_name_or_address: str, ctx: Context) -> dict:
+        """Perform comprehensive analysis of a function.
+
+        Returns metadata, control flow, callers/callees, prototype, and
+        decompiled code. Subsumes the old get_function_info tool.
 
         Args:
-            function_name_or_address: Function name or hex address
+            function_name_or_address: Function name or address
 
         Returns:
-            Dictionary with function info and disassembly lines.
-        """
-        ea = _resolve(function_name_or_address)
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return {"error": f"No function at {hex(ea)}"}
-
-        func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
-        lines = []
-        for item_ea in idautils.FuncItems(func.start_ea):
-            disasm = idc.generate_disasm_line(item_ea, 0)
-            lines.append(f"0x{item_ea:08x}  {disasm}")
-
-        return {
-            "function": func_name,
-            "address": hex(func.start_ea),
-            "disassembly": "\n".join(lines),
-            "instruction_count": len(lines),
-        }
-
-    @_tool("get_function_info", annotations=READ_ONLY)
-    @_ida_main_thread
-    def get_function_info(function_name_or_address: str, ctx: Context) -> dict:
-        """Get metadata about a function.
-
-        Args:
-            function_name_or_address: Function name or hex address
-
-        Returns:
-            Dictionary with start, end, size, frame info, flags.
+            Comprehensive function analysis including control flow and call info.
         """
         ea = _resolve(function_name_or_address)
         func = ida_funcs.get_func(ea)
@@ -250,17 +265,16 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
             return {"error": f"No function at {hex(ea)}"}
 
         func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
-        size = func.end_ea - func.start_ea
 
         result = {
             "name": func_name,
-            "start": hex(func.start_ea),
+            "address": hex(func.start_ea),
             "end": hex(func.end_ea),
-            "size": size,
+            "size": func.end_ea - func.start_ea,
             "flags": func.flags,
         }
 
-        # Try to get type info
+        # Prototype
         try:
             tif = ida_typeinf.tinfo_t()
             if ida_nalt.get_tinfo(tif, func.start_ea):
@@ -268,7 +282,48 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
         except Exception:
             pass
 
+        # Basic blocks (CFG complexity)
+        flow = idaapi.FlowChart(func)
+        blocks = list(flow)
+        result["basic_block_count"] = len(blocks)
+
+        # Instruction count
+        instructions = list(idautils.FuncItems(func.start_ea))
+        result["instruction_count"] = len(instructions)
+
+        # Callers and callees
+        callers = set()
+        for ref in idautils.CodeRefsTo(func.start_ea, 0):
+            cfunc = ida_funcs.get_func(ref)
+            if cfunc:
+                callers.add(ida_funcs.get_func_name(cfunc.start_ea))
+
+        callees = set()
+        for item_ea in instructions:
+            for ref in idautils.CodeRefsFrom(item_ea, 0):
+                cfunc = ida_funcs.get_func(ref)
+                if cfunc and cfunc.start_ea != func.start_ea:
+                    callees.add(ida_funcs.get_func_name(cfunc.start_ea))
+
+        result["callers"] = list(callers)
+        result["callees"] = list(callees)
+        result["caller_count"] = len(callers)
+        result["callee_count"] = len(callees)
+
+        # Try decompilation
+        try:
+            cfunc = ida_hexrays.decompile(func.start_ea)
+            if cfunc:
+                result["decompiled"] = str(cfunc)
+                result["variable_count"] = len(cfunc.get_lvars())
+        except Exception:
+            result["decompiled"] = None
+
         return result
+
+    # ================================================================== #
+    #  5. get_basic_blocks
+    # ================================================================== #
 
     @_tool("get_basic_blocks", annotations=READ_ONLY)
     @_ida_main_thread
@@ -301,38 +356,26 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
 
         return blocks
 
-    @_tool("get_il_expression", annotations=READ_ONLY)
-    def get_il_expression(function_name_or_address: str, ctx: Context) -> dict:
-        """Get pseudo-C (Hex-Rays) output for a function.
-
-        IDA only has ASM + decompiler output (no multi-level IL like Binary Ninja).
-
-        Args:
-            function_name_or_address: Function name or hex address
-
-        Returns:
-            Dictionary with pseudo-C code.
-        """
-        # Delegate to decompile_function
-        return decompile_function(function_name_or_address, ctx)
-
     # ================================================================== #
-    #  8. Cross-References
+    #  6. xrefs_tool (consolidated — absorbs get_xrefs + get_callers_callees)
     # ================================================================== #
 
-    @_tool("get_xrefs", annotations=READ_ONLY)
+    @_tool("xrefs_tool", annotations=READ_ONLY)
     @_ida_main_thread
-    def get_xrefs(address_or_name: str, ctx: Context, direction: str = "both") -> dict:
-        """Get cross-references to/from an address.
+    def xrefs_tool(address_or_function: str, ctx: Context,
+                   direction: str = "both",
+                   include_calls: bool = False) -> dict:
+        """Get cross-references and optionally callers/callees for an address or function.
 
         Args:
-            address_or_name: Address (hex) or symbol name
-            direction: 'to', 'from', or 'both'
+            address_or_function: Address (hex) or function name
+            direction: 'to', 'from', or 'both' for xref direction
+            include_calls: If True, also include callers/callees (like the old get_callers_callees)
 
         Returns:
-            Dictionary with code and data xrefs in both directions.
+            Dictionary with xrefs and optionally call graph info.
         """
-        ea = _resolve(address_or_name)
+        ea = _resolve(address_or_function)
 
         refs_to = []
         refs_from = []
@@ -353,7 +396,7 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
             for ref in idautils.DataRefsFrom(ea):
                 refs_from.append({"address": hex(ref), "type": "data"})
 
-        return {
+        result = {
             "address": hex(ea),
             "refs_to": refs_to,
             "refs_from": refs_from,
@@ -361,145 +404,398 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
             "total_from": len(refs_from),
         }
 
+        if include_calls:
+            func = ida_funcs.get_func(ea)
+            if func:
+                callers = []
+                callees = []
+
+                for ref in idautils.CodeRefsTo(func.start_ea, 0):
+                    caller_func = ida_funcs.get_func(ref)
+                    if caller_func:
+                        caller_name = ida_funcs.get_func_name(caller_func.start_ea)
+                        callers.append({"name": caller_name, "address": hex(caller_func.start_ea), "call_site": hex(ref)})
+
+                for item_ea in idautils.FuncItems(func.start_ea):
+                    for ref in idautils.CodeRefsFrom(item_ea, 0):
+                        callee_func = ida_funcs.get_func(ref)
+                        if callee_func and callee_func.start_ea != func.start_ea:
+                            callee_name = ida_funcs.get_func_name(callee_func.start_ea)
+                            callees.append({"name": callee_name, "address": hex(callee_func.start_ea), "call_site": hex(item_ea)})
+
+                # Deduplicate callees by target address
+                seen = set()
+                unique_callees = []
+                for c in callees:
+                    if c["address"] not in seen:
+                        seen.add(c["address"])
+                        unique_callees.append(c)
+
+                result["function"] = ida_funcs.get_func_name(func.start_ea)
+                result["callers"] = callers
+                result["callees"] = unique_callees
+                result["caller_count"] = len(callers)
+                result["callee_count"] = len(unique_callees)
+
+        return result
+
     # ================================================================== #
-    #  9. Comments
+    #  7. comments_tool (consolidated — absorbs get_comments + set_comment)
     # ================================================================== #
 
-    @_tool("get_comments", annotations=READ_ONLY)
+    @_tool("comments_tool", annotations=MODIFY)
     @_ida_main_thread
-    def get_comments(function_name_or_address: str, ctx: Context) -> dict:
-        """Get comments for a function (regular, repeatable, and function-level).
+    def comments_tool(action: str, ctx: Context,
+                      address_or_function: str = "",
+                      text: str = "",
+                      comment_type: str = "regular") -> dict:
+        """Unified tool for managing comments (get, set, list, remove).
 
         Args:
-            function_name_or_address: Function name or hex address
+            action: 'get' (comments for a function), 'set' (set comment at address),
+                    'list' (all comments across all functions), 'remove' (clear comment at address)
+            address_or_function: Function name/address (for get/set/remove)
+            text: Comment text (for 'set' action)
+            comment_type: 'regular', 'repeatable', or 'function' (for get/set/remove)
 
         Returns:
-            Dictionary with lists of comments found in the function.
+            Dictionary with comment data or confirmation message.
         """
-        ea = _resolve(function_name_or_address)
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return {"error": f"No function at {hex(ea)}"}
+        if action == "get":
+            if not address_or_function:
+                return {"error": "address_or_function is required for 'get' action"}
+            ea = _resolve(address_or_function)
+            func = ida_funcs.get_func(ea)
+            if not func:
+                return {"error": f"No function at {hex(ea)}"}
 
-        comments = []
+            comments = []
+            func_cmt = idc.get_func_cmt(func.start_ea, 0)
+            func_cmt_r = idc.get_func_cmt(func.start_ea, 1)
+            if func_cmt:
+                comments.append({"address": hex(func.start_ea), "type": "function", "text": func_cmt})
+            if func_cmt_r:
+                comments.append({"address": hex(func.start_ea), "type": "function_repeatable", "text": func_cmt_r})
 
-        # Function-level comment
-        func_cmt = idc.get_func_cmt(func.start_ea, 0)
-        func_cmt_r = idc.get_func_cmt(func.start_ea, 1)
-        if func_cmt:
-            comments.append({"address": hex(func.start_ea), "type": "function", "text": func_cmt})
-        if func_cmt_r:
-            comments.append({"address": hex(func.start_ea), "type": "function_repeatable", "text": func_cmt_r})
+            for item_ea in idautils.FuncItems(func.start_ea):
+                cmt = idc.get_cmt(item_ea, 0)
+                cmt_r = idc.get_cmt(item_ea, 1)
+                if cmt:
+                    comments.append({"address": hex(item_ea), "type": "regular", "text": cmt})
+                if cmt_r:
+                    comments.append({"address": hex(item_ea), "type": "repeatable", "text": cmt_r})
 
-        # Per-instruction comments
-        for item_ea in idautils.FuncItems(func.start_ea):
-            cmt = idc.get_cmt(item_ea, 0)
-            cmt_r = idc.get_cmt(item_ea, 1)
-            if cmt:
-                comments.append({"address": hex(item_ea), "type": "regular", "text": cmt})
-            if cmt_r:
-                comments.append({"address": hex(item_ea), "type": "repeatable", "text": cmt_r})
+            return {"function": ida_funcs.get_func_name(func.start_ea), "comments": comments}
 
-        return {"function": ida_funcs.get_func_name(func.start_ea), "comments": comments}
+        elif action == "set":
+            if not address_or_function:
+                return {"error": "address_or_function is required for 'set' action"}
+            ea = _resolve(address_or_function)
 
-    # ================================================================== #
-    #  10. Variables
-    # ================================================================== #
+            if comment_type == "function":
+                idc.set_func_cmt(ea, text, 0)
+            elif comment_type == "repeatable":
+                idc.set_cmt(ea, text, 1)
+            else:
+                idc.set_cmt(ea, text, 0)
 
-    @_tool("get_variables", annotations=READ_ONLY)
-    @_ida_main_thread
-    def get_variables(function_name_or_address: str, ctx: Context) -> dict:
-        """Get local variables for a function via Hex-Rays decompiler.
+            return {"status": "ok", "message": f"Set {comment_type} comment at {hex(ea)}"}
 
-        Args:
-            function_name_or_address: Function name or hex address
-
-        Returns:
-            Dictionary with list of local variables and their types.
-        """
-        ea = _resolve(function_name_or_address)
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return {"error": f"No function at {hex(ea)}"}
-
-        try:
-            cfunc = ida_hexrays.decompile(func.start_ea)
-            if not cfunc:
-                return {"error": "Decompilation failed"}
-
-            variables = []
-            for lvar in cfunc.get_lvars():
-                variables.append({
-                    "name": lvar.name,
-                    "type": str(lvar.type()),
-                    "is_arg": lvar.is_arg_var,
-                    "is_result": lvar.is_result_var if hasattr(lvar, 'is_result_var') else False,
-                })
-
-            return {
-                "function": ida_funcs.get_func_name(func.start_ea),
-                "variables": variables,
-                "count": len(variables),
-            }
-        except Exception as e:
-            return {"error": f"Cannot get variables: {e}"}
-
-    # ================================================================== #
-    #  11. Types
-    # ================================================================== #
-
-    @_tool("get_types", annotations=READ_ONLY)
-    @_ida_main_thread
-    def get_types(ctx: Context, filter: str = "") -> dict:
-        """List local types (structs, enums, typedefs) in the IDB.
-
-        Args:
-            filter: Optional substring filter on type name
-
-        Returns:
-            Dictionary with list of local type definitions.
-        """
-        til = ida_typeinf.get_idati()
-        if not til:
-            return {"error": "Cannot access type library"}
-
-        types_list = []
-        count = ida_typeinf.get_ordinal_qty(til)
-        for ordinal in range(1, count + 1):
-            tif = ida_typeinf.tinfo_t()
-            if tif.get_numbered_type(til, ordinal):
-                name = tif.get_type_name() or f"type_{ordinal}"
-                if filter and filter.lower() not in name.lower():
+        elif action == "list":
+            comments = []
+            for func_ea in idautils.Functions():
+                func = ida_funcs.get_func(func_ea)
+                if not func:
                     continue
+                func_name = ida_funcs.get_func_name(func_ea) or f"sub_{func_ea:x}"
 
-                kind = "unknown"
-                if tif.is_struct():
-                    kind = "struct"
-                elif tif.is_enum():
-                    kind = "enum"
-                elif tif.is_typedef():
-                    kind = "typedef"
-                elif tif.is_func():
-                    kind = "function"
+                func_cmt = idc.get_func_cmt(func_ea, 0)
+                func_cmt_r = idc.get_func_cmt(func_ea, 1)
+                if func_cmt:
+                    comments.append({"function": func_name, "address": hex(func_ea), "type": "function", "text": func_cmt})
+                if func_cmt_r:
+                    comments.append({"function": func_name, "address": hex(func_ea), "type": "function_repeatable", "text": func_cmt_r})
 
-                types_list.append({
-                    "name": name,
-                    "ordinal": ordinal,
-                    "kind": kind,
-                    "size": tif.get_size(),
-                    "definition": str(tif),
-                })
+                for item_ea in idautils.FuncItems(func_ea):
+                    cmt = idc.get_cmt(item_ea, 0)
+                    cmt_r = idc.get_cmt(item_ea, 1)
+                    if cmt:
+                        comments.append({"function": func_name, "address": hex(item_ea), "type": "regular", "text": cmt})
+                    if cmt_r:
+                        comments.append({"function": func_name, "address": hex(item_ea), "type": "repeatable", "text": cmt_r})
 
-        return {"types": types_list, "count": len(types_list)}
+            return {"comments": comments, "count": len(comments)}
+
+        elif action == "remove":
+            if not address_or_function:
+                return {"error": "address_or_function is required for 'remove' action"}
+            ea = _resolve(address_or_function)
+
+            if comment_type == "function":
+                idc.set_func_cmt(ea, "", 0)
+            elif comment_type == "repeatable":
+                idc.set_cmt(ea, "", 1)
+            else:
+                idc.set_cmt(ea, "", 0)
+
+            return {"status": "ok", "message": f"Removed {comment_type} comment at {hex(ea)}"}
+
+        else:
+            return {"error": f"Unknown action '{action}'. Use 'get', 'set', 'list', or 'remove'."}
 
     # ================================================================== #
-    #  12-16. Function Discovery
+    #  8. variables_tool (consolidated — absorbs get_variables + rename_variable)
     # ================================================================== #
 
-    @_tool("list_functions", annotations=READ_ONLY)
+    @_tool("variables_tool", annotations=MODIFY)
     @_ida_main_thread
-    def list_functions(ctx: Context, filter: str = "", limit: int = 200,
-                       offset: int = 0) -> dict:
+    def variables_tool(action: str, ctx: Context,
+                       function_name_or_address: str = "",
+                       var_name: str = "",
+                       new_name: str = "") -> dict:
+        """Unified tool for managing local variables (list, rename).
+
+        Args:
+            action: 'list' (get variables for a function) or 'rename' (rename a variable)
+            function_name_or_address: Function name or hex address
+            var_name: Current variable name (for 'rename')
+            new_name: New variable name (for 'rename')
+
+        Returns:
+            Dictionary with variable data or confirmation message.
+        """
+        if action == "list":
+            if not function_name_or_address:
+                return {"error": "function_name_or_address is required for 'list' action"}
+            ea = _resolve(function_name_or_address)
+            func = ida_funcs.get_func(ea)
+            if not func:
+                return {"error": f"No function at {hex(ea)}"}
+
+            try:
+                cfunc = ida_hexrays.decompile(func.start_ea)
+                if not cfunc:
+                    return {"error": "Decompilation failed"}
+
+                variables = []
+                for lvar in cfunc.get_lvars():
+                    variables.append({
+                        "name": lvar.name,
+                        "type": str(lvar.type()),
+                        "is_arg": lvar.is_arg_var,
+                        "is_result": lvar.is_result_var if hasattr(lvar, 'is_result_var') else False,
+                    })
+
+                return {
+                    "function": ida_funcs.get_func_name(func.start_ea),
+                    "variables": variables,
+                    "count": len(variables),
+                }
+            except Exception as e:
+                return {"error": f"Cannot get variables: {e}"}
+
+        elif action == "rename":
+            if not function_name_or_address:
+                return {"error": "function_name_or_address is required for 'rename' action"}
+            if not var_name or not new_name:
+                return {"error": "var_name and new_name are required for 'rename' action"}
+
+            ea = _resolve(function_name_or_address)
+            func_ea = ida_funcs.get_func(ea)
+            if not func_ea:
+                return {"error": f"No function at {hex(ea)}"}
+
+            try:
+                if ida_hexrays.rename_lvar(func_ea.start_ea, var_name, new_name):
+                    return {"status": "ok", "message": f"Renamed variable '{var_name}' to '{new_name}'"}
+                else:
+                    return {"error": f"rename_lvar failed (variable '{var_name}' may not exist)"}
+            except Exception as e:
+                return {"error": f"Failed: {e}"}
+
+        else:
+            return {"error": f"Unknown action '{action}'. Use 'list' or 'rename'."}
+
+    # ================================================================== #
+    #  9. types_tool (consolidated — absorbs get_types + set_type + create_struct + create_enum)
+    # ================================================================== #
+
+    @_tool("types_tool", annotations=MODIFY)
+    @_ida_main_thread
+    def types_tool(action: str, ctx: Context,
+                   filter: str = "",
+                   address: str = "",
+                   type_string: str = "",
+                   name: str = "",
+                   members: Any = None,
+                   width: int = 0,
+                   bitfield: bool = False) -> dict:
+        """Unified tool for managing types (list, set, create_struct, create_enum).
+
+        Args:
+            action: 'list', 'set', 'create_struct', or 'create_enum'
+            filter: Substring filter for 'list' action
+            address: Hex address for 'set' action
+            type_string: C-style type string for 'set' action (e.g. 'int __cdecl(int, char *)')
+            name: Type name for 'create_struct' or 'create_enum'
+            members: For create_struct: list of dicts with 'name', 'type', 'size'.
+                     For create_enum: dict of member_name -> value.
+            width: Enum member width in bytes (for create_enum, 0 = auto)
+            bitfield: Whether enum is a bitfield (for create_enum)
+
+        Returns:
+            Dictionary with type data or confirmation message.
+        """
+        if action == "list":
+            til = ida_typeinf.get_idati()
+            if not til:
+                return {"error": "Cannot access type library"}
+
+            types_list = []
+            ordinal = 1
+            consecutive_empty = 0
+            while consecutive_empty < 200:
+                tif = ida_typeinf.tinfo_t()
+                if tif.get_numbered_type(til, ordinal):
+                    consecutive_empty = 0
+                    tname = tif.get_type_name() or f"type_{ordinal}"
+                    if not filter or filter.lower() in tname.lower():
+                        kind = "unknown"
+                        if tif.is_struct():
+                            kind = "struct"
+                        elif tif.is_enum():
+                            kind = "enum"
+                        elif tif.is_typedef():
+                            kind = "typedef"
+                        elif tif.is_func():
+                            kind = "function"
+
+                        types_list.append({
+                            "name": tname,
+                            "ordinal": ordinal,
+                            "kind": kind,
+                            "size": tif.get_size(),
+                            "definition": str(tif),
+                        })
+                else:
+                    consecutive_empty += 1
+                ordinal += 1
+
+            return {"types": types_list, "count": len(types_list)}
+
+        elif action == "set":
+            if not address:
+                return {"error": "address is required for 'set' action"}
+            if not type_string:
+                return {"error": "type_string is required for 'set' action"}
+
+            ea = parse_address(address)
+            if ea is None:
+                return {"error": f"Invalid address: {address}"}
+
+            try:
+                til = ida_typeinf.get_idati()
+                # Ensure semicolon for parse_decl
+                decl = type_string if type_string.rstrip().endswith(";") else type_string + ";"
+
+                # Method 1: apply_cdecl — most robust for function prototypes
+                # and calling conventions (__fastcall, __cdecl, etc.)
+                try:
+                    if ida_typeinf.apply_cdecl(None, ea, decl):
+                        return {"status": "ok", "message": f"Set type at {hex(ea)} to '{type_string}'"}
+                except (AttributeError, TypeError):
+                    pass
+
+                # Method 2: parse_decl (flag 0 first, then PT_SIL)
+                tif = ida_typeinf.tinfo_t()
+                parsed = ida_typeinf.parse_decl(tif, til, decl, 0)
+                if not parsed:
+                    parsed = ida_typeinf.parse_decl(tif, til, decl, ida_typeinf.PT_SIL)
+                if not parsed:
+                    # Method 3: for bare function types like "void __cdecl(int)",
+                    # insert a placeholder name that parse_decl requires
+                    named_decl = re.sub(
+                        r'((?:__\w+|)\s*)\(',
+                        r'\1 _placeholder(',
+                        decl, count=1)
+                    parsed = ida_typeinf.parse_decl(tif, til, named_decl, 0)
+
+                if parsed:
+                    if ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
+                        return {"status": "ok", "message": f"Set type at {hex(ea)} to '{type_string}'"}
+                    return {"error": "apply_tinfo failed"}
+
+                return {"error": f"Could not parse type: {type_string}"}
+            except Exception as e:
+                return {"error": f"Failed: {e}"}
+
+        elif action == "create_struct":
+            if not name:
+                return {"error": "name is required for 'create_struct' action"}
+            if not members or not isinstance(members, list):
+                return {"error": "members (list of dicts) is required for 'create_struct' action"}
+
+            try:
+                udt = ida_typeinf.udt_type_data_t()
+                til = ida_typeinf.get_idati()
+
+                for member in members:
+                    udm = ida_typeinf.udt_member_t()
+                    udm.name = member["name"]
+
+                    mtif = ida_typeinf.tinfo_t()
+                    type_str = member.get("type", "int")
+                    if not ida_typeinf.parse_decl(mtif, til, f"{type_str} x;", ida_typeinf.PT_SIL):
+                        # Fallback to byte array
+                        msize = member.get("size", 4)
+                        mtif.create_array(ida_typeinf.tinfo_t(ida_typeinf.BT_INT8), msize)
+
+                    udm.type = mtif
+                    udm.size = mtif.get_size() * 8  # size in bits
+                    udt.push_back(udm)
+
+                tif = ida_typeinf.tinfo_t()
+                tif.create_udt(udt, ida_typeinf.BTF_STRUCT)
+                tif.set_named_type(til, name)
+                return {"status": "ok", "message": f"Created struct '{name}' with {len(members)} members"}
+            except Exception as e:
+                return {"error": f"Failed to create struct: {e}"}
+
+        elif action == "create_enum":
+            if not name:
+                return {"error": "name is required for 'create_enum' action"}
+            if not members or not isinstance(members, dict):
+                return {"error": "members (dict of name -> value) is required for 'create_enum' action"}
+
+            try:
+                edt = ida_typeinf.enum_type_data_t()
+                for mname, mval in members.items():
+                    em = ida_typeinf.edm_t()
+                    em.name = mname
+                    em.value = mval
+                    edt.push_back(em)
+
+                if bitfield:
+                    edt.bte |= ida_typeinf.BTE_BITFIELD
+
+                tif = ida_typeinf.tinfo_t()
+                tif.create_enum(edt)
+                tif.set_named_type(ida_typeinf.get_idati(), name)
+                return {"status": "ok", "message": f"Created enum '{name}' with {len(members)} members"}
+            except Exception as e:
+                return {"error": f"Failed to create enum: {e}"}
+
+        else:
+            return {"error": f"Unknown action '{action}'. Use 'list', 'set', 'create_struct', or 'create_enum'."}
+
+    # ================================================================== #
+    #  10-14. Function Discovery
+    # ================================================================== #
+
+    @_tool("get_functions", annotations=READ_ONLY)
+    @_ida_main_thread
+    def get_functions(ctx: Context, filter: str = "", limit: int = 200,
+                      offset: int = 0) -> dict:
         """List all functions in the binary with optional filtering and pagination.
 
         Args:
@@ -534,11 +830,11 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
             "returned": len(page),
         }
 
-    @_tool("search_functions", annotations=READ_ONLY)
+    @_tool("search_functions_by_name", annotations=READ_ONLY)
     @_ida_main_thread
-    def search_functions(search_term: str, ctx: Context,
-                         min_size: int = 0, max_size: int = 0,
-                         limit: int = 100) -> list:
+    def search_functions_by_name(search_term: str, ctx: Context,
+                                 min_size: int = 0, max_size: int = 0,
+                                 limit: int = 100) -> list:
         """Search functions by name pattern, with optional size filters.
 
         Args:
@@ -627,58 +923,104 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
             "size": func.end_ea - func.start_ea,
         }
 
-    @_tool("get_callers_callees", annotations=READ_ONLY)
+    @_tool("get_function_statistics", annotations=READ_ONLY)
     @_ida_main_thread
-    def get_callers_callees(function_name_or_address: str, ctx: Context) -> dict:
-        """Get the call graph (callers and callees) for a function.
-
-        Args:
-            function_name_or_address: Function name or hex address
+    def get_function_statistics(ctx: Context) -> dict:
+        """Get comprehensive statistics about all functions in the binary.
 
         Returns:
-            Dictionary with callers and callees lists.
+            Statistics including counts, sizes, and top functions.
         """
-        ea = _resolve(function_name_or_address)
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return {"error": f"No function at {hex(ea)}"}
+        sizes = []
+        for func_ea in idautils.Functions():
+            func = ida_funcs.get_func(func_ea)
+            if func:
+                sizes.append((func_ea, func.end_ea - func.start_ea))
 
-        callers = []
-        callees = []
+        if not sizes:
+            return {"error": "No functions found"}
 
-        # Callers: code xrefs TO the function start
-        for ref in idautils.CodeRefsTo(func.start_ea, 0):
-            caller_func = ida_funcs.get_func(ref)
-            if caller_func:
-                caller_name = ida_funcs.get_func_name(caller_func.start_ea)
-                callers.append({"name": caller_name, "address": hex(caller_func.start_ea), "call_site": hex(ref)})
+        total_size = sum(s for _, s in sizes)
+        avg_size = total_size // len(sizes) if sizes else 0
+        sorted_by_size = sorted(sizes, key=lambda x: x[1], reverse=True)
 
-        # Callees: code xrefs FROM instructions inside the function
-        for item_ea in idautils.FuncItems(func.start_ea):
-            for ref in idautils.CodeRefsFrom(item_ea, 0):
-                callee_func = ida_funcs.get_func(ref)
-                if callee_func and callee_func.start_ea != func.start_ea:
-                    callee_name = ida_funcs.get_func_name(callee_func.start_ea)
-                    callees.append({"name": callee_name, "address": hex(callee_func.start_ea), "call_site": hex(item_ea)})
-
-        # Deduplicate callees by target address
-        seen = set()
-        unique_callees = []
-        for c in callees:
-            if c["address"] not in seen:
-                seen.add(c["address"])
-                unique_callees.append(c)
+        top_10 = []
+        for ea, sz in sorted_by_size[:10]:
+            top_10.append({
+                "name": ida_funcs.get_func_name(ea),
+                "address": hex(ea),
+                "size": sz,
+            })
 
         return {
-            "function": ida_funcs.get_func_name(func.start_ea),
-            "callers": callers,
-            "callees": unique_callees,
-            "caller_count": len(callers),
-            "callee_count": len(unique_callees),
+            "total_functions": len(sizes),
+            "total_code_size": total_size,
+            "average_size": avg_size,
+            "max_size": sorted_by_size[0][1] if sorted_by_size else 0,
+            "min_size": sorted_by_size[-1][1] if sorted_by_size else 0,
+            "top_10_largest": top_10,
         }
 
     # ================================================================== #
-    #  17-20. Binary Info
+    #  15-16. Symbol Management
+    # ================================================================== #
+
+    @_tool("rename_symbol", annotations=MODIFY)
+    @_ida_main_thread
+    def rename_symbol(address_or_name: str, new_name: str, ctx: Context) -> str:
+        """Rename any symbol (function or data) at the given address/name.
+
+        Args:
+            address_or_name: Current address or name
+            new_name: New name
+
+        Returns:
+            Success or failure message.
+        """
+        ea = _resolve(address_or_name)
+        old_name = ida_name.get_name(ea) or f"loc_{ea:x}"
+        if ida_name.set_name(ea, new_name, ida_name.SN_CHECK):
+            return f"Renamed '{old_name}' to '{new_name}'"
+        else:
+            return f"Failed to rename to '{new_name}'"
+
+    @_tool("batch_rename", annotations=MODIFY)
+    @_ida_main_thread
+    def batch_rename(renames: list, ctx: Context) -> list:
+        """Batch rename multiple symbols.
+
+        Args:
+            renames: List of dicts with 'address_or_name' and 'new_name' keys
+
+        Returns:
+            List of results for each rename operation.
+        """
+        results = []
+        for entry in renames:
+            addr_or_name = entry.get("address_or_name", "")
+            new_name = entry.get("new_name", "")
+            if not addr_or_name or not new_name:
+                results.append({"address_or_name": addr_or_name, "success": False, "error": "Missing fields"})
+                continue
+
+            try:
+                ea = _resolve(addr_or_name)
+                old_name = ida_name.get_name(ea) or f"loc_{ea:x}"
+                success = ida_name.set_name(ea, new_name, ida_name.SN_CHECK)
+
+                results.append({
+                    "address": hex(ea),
+                    "old_name": old_name,
+                    "new_name": new_name,
+                    "success": success,
+                })
+            except Exception as e:
+                results.append({"address_or_name": addr_or_name, "success": False, "error": str(e)})
+
+        return results
+
+    # ================================================================== #
+    #  17-21. Binary Info
     # ================================================================== #
 
     @_tool("get_imports", annotations=READ_ONLY)
@@ -805,135 +1147,28 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
 
         return segments
 
-    # ================================================================== #
-    #  21-23. Symbol Management (Modify)
-    # ================================================================== #
-
-    @_tool("rename_function", annotations=MODIFY)
+    @_tool("get_entry_points", annotations=READ_ONLY)
     @_ida_main_thread
-    def rename_function(address_or_name: str, new_name: str, ctx: Context) -> str:
-        """Rename a function in the IDB.
-
-        Args:
-            address_or_name: Current function address or name
-            new_name: New name for the function
+    def get_entry_points(ctx: Context) -> list:
+        """Get all binary entry points.
 
         Returns:
-            Success or failure message.
+            List of entry point dictionaries with name and address.
         """
-        ea = _resolve(address_or_name)
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return f"No function at {hex(ea)}"
-
-        old_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
-        if ida_name.set_name(func.start_ea, new_name, ida_name.SN_CHECK):
-            return f"Renamed '{old_name}' to '{new_name}'"
-        else:
-            return f"Failed to rename function to '{new_name}'"
-
-    @_tool("rename_variable", annotations=MODIFY)
-    @_ida_main_thread
-    def rename_variable(function_address: str, old_name: str, new_name: str,
-                        ctx: Context) -> str:
-        """Rename a local variable in a decompiled function.
-
-        Args:
-            function_address: Function address (hex string)
-            old_name: Current variable name
-            new_name: New variable name
-
-        Returns:
-            Success or failure message.
-        """
-        func_ea = parse_address(function_address)
-        if func_ea is None:
-            return f"Invalid address: {function_address}"
-
-        try:
-            cfunc = ida_hexrays.decompile(func_ea)
-            if not cfunc:
-                return "Failed: Decompilation failed"
-
-            lvars = cfunc.get_lvars()
-            target = None
-            for lvar in lvars:
-                if lvar.name == old_name:
-                    target = lvar
-                    break
-
-            if not target:
-                return f"Failed: Variable '{old_name}' not found"
-
-            if ida_hexrays.rename_lvar(cfunc, target, new_name):
-                return f"Renamed variable '{old_name}' to '{new_name}'"
-            else:
-                return "Failed: rename_lvar failed"
-        except Exception as e:
-            return f"Failed: {e}"
-
-    @_tool("set_type", annotations=MODIFY)
-    @_ida_main_thread
-    def set_type(address: str, type_string: str, ctx: Context) -> str:
-        """Set the type of a function or variable at the given address.
-
-        Args:
-            address: Hex address
-            type_string: C-style type string (e.g. 'int __cdecl(int, char *)')
-
-        Returns:
-            Success or failure message.
-        """
-        ea = parse_address(address)
-        if ea is None:
-            return f"Invalid address: {address}"
-
-        try:
-            tif = ida_typeinf.tinfo_t()
-            til = ida_typeinf.get_idati()
-            if ida_typeinf.parse_decl(tif, til, type_string, ida_typeinf.PT_SIL):
-                if ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
-                    return f"Set type at {hex(ea)} to '{type_string}'"
-                else:
-                    return "Failed: apply_tinfo failed"
-            else:
-                return f"Failed: Could not parse type: {type_string}"
-        except Exception as e:
-            return f"Failed: {e}"
+        entries = []
+        for i in range(ida_entry.get_entry_qty()):
+            ordinal = ida_entry.get_entry_ordinal(i)
+            ea = ida_entry.get_entry(ordinal)
+            name = ida_entry.get_entry_name(ordinal) or f"entry_{ordinal}"
+            entries.append({
+                "name": name,
+                "address": hex(ea),
+                "ordinal": ordinal,
+            })
+        return entries
 
     # ================================================================== #
-    #  24. Set Comment (Modify)
-    # ================================================================== #
-
-    @_tool("set_comment", annotations=MODIFY)
-    @_ida_main_thread
-    def set_comment(address: str, text: str, ctx: Context,
-                    comment_type: str = "regular") -> str:
-        """Set a comment at an address.
-
-        Args:
-            address: Hex address
-            text: Comment text
-            comment_type: 'regular', 'repeatable', or 'function'
-
-        Returns:
-            Success message.
-        """
-        ea = parse_address(address)
-        if ea is None:
-            return f"Invalid address: {address}"
-
-        if comment_type == "function":
-            idc.set_func_cmt(ea, text, 0)
-        elif comment_type == "repeatable":
-            idc.set_cmt(ea, text, 1)
-        else:
-            idc.set_cmt(ea, text, 0)
-
-        return f"Set {comment_type} comment at {hex(ea)}"
-
-    # ================================================================== #
-    #  25-28. Data Analysis (Modify)
+    #  22-25. Data Analysis
     # ================================================================== #
 
     @_tool("read_memory", annotations=READ_ONLY)
@@ -964,76 +1199,151 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
             "printable": "".join(chr(b) if 32 <= b < 127 else "." for b in data),
         }
 
-    @_tool("create_struct", annotations=MODIFY)
+    @_tool("get_data_at", annotations=READ_ONLY)
     @_ida_main_thread
-    def create_struct(name: str, members: list, ctx: Context) -> str:
-        """Create a new struct type in the IDB.
+    def get_data_at(address: str, ctx: Context, size: int = 0) -> dict:
+        """Get typed data at a specific address.
 
         Args:
-            name: Struct name
-            members: List of dicts with 'name', 'type', 'size' keys.
-                     Example: [{"name": "field1", "type": "int", "size": 4}]
+            address: Hex address
+            size: Optional explicit size (0 = auto-detect from IDB item)
 
         Returns:
-            Success or failure message.
+            Dictionary with typed data values.
         """
-        try:
-            udt = ida_typeinf.udt_type_data_t()
+        ea = parse_address(address)
+        if ea is None:
+            return {"error": f"Invalid address: {address}"}
 
-            for member in members:
-                udm = ida_typeinf.udt_member_t()
-                udm.name = member["name"]
+        if size == 0:
+            size = ida_bytes.get_item_size(ea)
+            if size == 0:
+                size = 8  # fallback
 
-                mtif = ida_typeinf.tinfo_t()
-                til = ida_typeinf.get_idati()
-                type_str = member.get("type", "int")
-                if not ida_typeinf.parse_decl(mtif, til, f"{type_str} x;", ida_typeinf.PT_SIL):
-                    # Fallback to byte array
-                    msize = member.get("size", 4)
-                    mtif.create_array(ida_typeinf.tinfo_t(ida_typeinf.BT_INT8), msize)
+        data = ida_bytes.get_bytes(ea, min(size, 4096))
+        if data is None:
+            return {"error": f"Cannot read at {hex(ea)}"}
 
-                udm.type = mtif
-                udm.size = mtif.get_size() * 8  # size in bits
-                udt.push_back(udm)
+        result = {
+            "address": hex(ea),
+            "item_size": size,
+            "hex": data.hex(),
+        }
 
-            tif = ida_typeinf.tinfo_t()
-            tif.create_udt(udt, ida_typeinf.BTF_STRUCT)
-            tif.set_named_type(ida_typeinf.get_idati(), name)
-            return f"Created struct '{name}' with {len(members)} members"
-        except Exception as e:
-            return f"Failed to create struct: {e}"
+        if size >= 1:
+            result["byte"] = ida_bytes.get_byte(ea)
+        if size >= 2:
+            result["word"] = ida_bytes.get_word(ea)
+        if size >= 4:
+            result["dword"] = ida_bytes.get_dword(ea)
+        if size >= 8:
+            result["qword"] = ida_bytes.get_qword(ea)
 
-    @_tool("create_enum", annotations=MODIFY)
+        name = ida_name.get_name(ea)
+        if name:
+            result["name"] = name
+
+        return result
+
+    @_tool("search_bytes", annotations=READ_ONLY)
     @_ida_main_thread
-    def create_enum(name: str, members: dict, ctx: Context,
-                    bitfield: bool = False) -> str:
-        """Create a new enum type in the IDB.
+    def search_bytes(pattern: str, ctx: Context, start_address: str = "",
+                     max_results: int = 100) -> list:
+        """Search for a byte pattern in the binary.
 
         Args:
-            name: Enum name
-            members: Dict of member_name -> value (e.g. {"OK": 0, "ERR": 1})
-            bitfield: Whether this is a bitfield enum
+            pattern: Hex byte pattern (e.g. '90 90 90' or '4883EC')
+            start_address: Optional start address (default: binary start)
+            max_results: Maximum number of results
 
         Returns:
-            Success or failure message.
+            List of matching addresses.
         """
-        try:
-            edt = ida_typeinf.enum_type_data_t()
-            for mname, mval in members.items():
-                em = ida_typeinf.edm_t()
-                em.name = mname
-                em.value = mval
-                edt.push_back(em)
+        clean = pattern.replace(" ", "")
+        if len(clean) % 2 != 0:
+            return [{"error": "Pattern must have even number of hex chars"}]
 
-            if bitfield:
-                edt.bte |= ida_typeinf.BTE_BITFIELD
+        search_pattern = " ".join(clean[i:i+2] for i in range(0, len(clean), 2))
 
-            tif = ida_typeinf.tinfo_t()
-            tif.create_enum(edt)
-            tif.set_named_type(ida_typeinf.get_idati(), name)
-            return f"Created enum '{name}' with {len(members)} members"
-        except Exception as e:
-            return f"Failed to create enum: {e}"
+        if start_address:
+            start_ea = parse_address(start_address)
+            if start_ea is None:
+                return [{"error": f"Invalid start address: {start_address}"}]
+        else:
+            start_ea = ida_ida.inf_get_min_ea()
+
+        compiled = ida_bytes.compiled_binpat_vec_t()
+        ida_bytes.parse_binpat_str(compiled, start_ea, search_pattern, 16)
+
+        results = []
+        ea = start_ea
+        for _ in range(max_results):
+            search_result = ida_bytes.bin_search(
+                ea, idaapi.BADADDR, compiled,
+                ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOBREAK)
+            # IDA 9.x returns (ea, size) tuple; older versions return ea
+            if isinstance(search_result, tuple):
+                ea = int(search_result[0])
+            else:
+                ea = int(search_result)
+            if ea == idaapi.BADADDR:
+                break
+
+            func = ida_funcs.get_func(ea)
+            fname = ida_funcs.get_func_name(func.start_ea) if func else None
+
+            results.append({
+                "address": hex(ea),
+                "function": fname,
+            })
+            ea += 1  # advance past match
+
+        return results
+
+    @_tool("search_strings", annotations=READ_ONLY)
+    @_ida_main_thread
+    def search_strings(pattern: str, ctx: Context, case_sensitive: bool = False,
+                       page_size: int = 100, page_number: int = 1) -> dict:
+        """Search for strings matching a pattern with pagination.
+
+        Args:
+            pattern: Search pattern (substring match)
+            case_sensitive: Case-sensitive matching
+            page_size: Number of results per page
+            page_number: Page number (1-indexed)
+
+        Returns:
+            Dictionary with matching strings and pagination info.
+        """
+        matches = []
+        pat = pattern if case_sensitive else pattern.lower()
+
+        for s in idautils.Strings():
+            value = str(s)
+            compare = value if case_sensitive else value.lower()
+            if pat in compare:
+                matches.append({
+                    "address": hex(s.ea),
+                    "value": value,
+                    "length": s.length,
+                })
+
+        total = len(matches)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        start = (page_number - 1) * page_size
+        page = matches[start:start + page_size]
+
+        return {
+            "strings": page,
+            "page_size": page_size,
+            "page_number": page_number,
+            "total_count": total,
+            "total_pages": total_pages,
+        }
+
+    # ================================================================== #
+    #  26. Patching
+    # ================================================================== #
 
     @_tool("patch_bytes", annotations=NON_IDEMPOTENT)
     @_ida_main_thread
@@ -1062,7 +1372,7 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
         return f"Patched {len(data)} bytes at {hex(ea)}"
 
     # ================================================================== #
-    #  29-30. Navigation (Modify)
+    #  27-28. Navigation
     # ================================================================== #
 
     @_tool("navigate_to", annotations=MODIFY)
@@ -1107,7 +1417,299 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
         return f"Bookmark set at {hex(ea)} (slot {slot}): {description}"
 
     # ================================================================== #
-    #  31-33. Task Management
+    #  29. get_current_address (NEW — feature parity with BinAssistMCP)
+    # ================================================================== #
+
+    @_tool("get_current_address", annotations=READ_ONLY)
+    @_ida_main_thread
+    def get_current_address(ctx: Context) -> dict:
+        """Get the address at the current cursor position in IDA.
+
+        Returns:
+            Dictionary with address, name, and containing function info.
+        """
+        ea = ida_kernwin.get_screen_ea()
+        result = {
+            "address": hex(ea),
+        }
+
+        name = ida_name.get_name(ea)
+        if name:
+            result["name"] = name
+
+        func = ida_funcs.get_func(ea)
+        if func:
+            result["function"] = ida_funcs.get_func_name(func.start_ea)
+            result["function_address"] = hex(func.start_ea)
+
+        return result
+
+    # ================================================================== #
+    #  30. get_current_function (NEW — feature parity with BinAssistMCP)
+    # ================================================================== #
+
+    @_tool("get_current_function", annotations=READ_ONLY)
+    @_ida_main_thread
+    def get_current_function(ctx: Context) -> dict:
+        """Get info about the function at the current cursor position.
+
+        Returns:
+            Function info dictionary if cursor is inside a function, error otherwise.
+        """
+        ea = ida_kernwin.get_screen_ea()
+        func = ida_funcs.get_func(ea)
+        if not func:
+            return {"error": f"No function at cursor position ({hex(ea)})"}
+
+        func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
+        result = {
+            "name": func_name,
+            "address": hex(func.start_ea),
+            "end": hex(func.end_ea),
+            "size": func.end_ea - func.start_ea,
+            "cursor_offset": ea - func.start_ea,
+        }
+
+        try:
+            tif = ida_typeinf.tinfo_t()
+            if ida_nalt.get_tinfo(tif, func.start_ea):
+                result["prototype"] = str(tif)
+        except Exception:
+            pass
+
+        return result
+
+    # ================================================================== #
+    #  31. get_function_stack_layout (NEW — feature parity with BinAssistMCP)
+    # ================================================================== #
+
+    @_tool("get_function_stack_layout", annotations=READ_ONLY)
+    @_ida_main_thread
+    def get_function_stack_layout(function_name_or_address: str, ctx: Context) -> dict:
+        """Get stack frame layout for a function.
+
+        Args:
+            function_name_or_address: Function name or hex address
+
+        Returns:
+            Dictionary with stack frame members (locals, args, saved regs).
+        """
+        ea = _resolve(function_name_or_address)
+        func = ida_funcs.get_func(ea)
+        if not func:
+            return {"error": f"No function at {hex(ea)}"}
+
+        frame_id = idc.get_frame_id(func.start_ea)
+        if frame_id is None or frame_id == idaapi.BADADDR:
+            return {"error": f"No stack frame for function at {hex(func.start_ea)}"}
+
+        members = []
+        try:
+            for offset, name, size in idautils.StructMembers(frame_id):
+                member_type = "local"
+                if name.startswith(" r") or name.startswith(" s"):
+                    member_type = "saved_reg"
+
+                members.append({
+                    "name": name,
+                    "offset": offset,
+                    "size": size,
+                    "type": member_type,
+                })
+        except Exception as e:
+            return {"error": f"Failed to read stack frame: {e}"}
+
+        func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
+        return {
+            "function": func_name,
+            "address": hex(func.start_ea),
+            "frame_size": idc.get_frame_size(func.start_ea),
+            "local_size": idc.get_frame_lvar_size(func.start_ea),
+            "args_size": idc.get_frame_args_size(func.start_ea),
+            "members": members,
+        }
+
+    # ================================================================== #
+    #  32. get_classes (NEW — feature parity with BinAssistMCP)
+    # ================================================================== #
+
+    @_tool("get_classes", annotations=READ_ONLY)
+    @_ida_main_thread
+    def get_classes(ctx: Context, filter: str = "") -> dict:
+        """Get struct/class types from the type library.
+
+        Args:
+            filter: Optional substring filter on type name
+
+        Returns:
+            Dictionary with list of struct/union types.
+        """
+        til = ida_typeinf.get_idati()
+        if not til:
+            return {"error": "Cannot access type library"}
+
+        classes = []
+        ordinal = 1
+        consecutive_empty = 0
+        while consecutive_empty < 200:
+            tif = ida_typeinf.tinfo_t()
+            if tif.get_numbered_type(til, ordinal):
+                consecutive_empty = 0
+                if tif.is_struct() or tif.is_union():
+                    tname = tif.get_type_name() or f"type_{ordinal}"
+                    if not filter or filter.lower() in tname.lower():
+                        udt = ida_typeinf.udt_type_data_t()
+                        member_count = 0
+                        if tif.get_udt_details(udt):
+                            member_count = udt.size()
+
+                        classes.append({
+                            "name": tname,
+                            "ordinal": ordinal,
+                            "kind": "union" if tif.is_union() else "struct",
+                            "size": tif.get_size(),
+                            "member_count": member_count,
+                            "definition": str(tif),
+                        })
+            else:
+                consecutive_empty += 1
+            ordinal += 1
+
+        return {"classes": classes, "count": len(classes)}
+
+    # ================================================================== #
+    #  33. create_data_var (NEW — feature parity with BinAssistMCP)
+    # ================================================================== #
+
+    @_tool("create_data_var", annotations=MODIFY)
+    @_ida_main_thread
+    def create_data_var(address: str, data_type: str, ctx: Context) -> str:
+        """Define a data variable at an address with specified type.
+
+        Args:
+            address: Hex address
+            data_type: Type of data - 'byte', 'word', 'dword', 'qword', 'float',
+                       'double', 'ascii', or a C type string
+
+        Returns:
+            Success or failure message.
+        """
+        ea = parse_address(address)
+        if ea is None:
+            return f"Invalid address: {address}"
+
+        type_map = {
+            "byte": (idc.create_byte, 1),
+            "word": (idc.create_word, 2),
+            "dword": (idc.create_dword, 4),
+            "qword": (idc.create_qword, 8),
+            "float": (lambda a: ida_bytes.create_data(a, idaapi.FF_FLOAT, 4, idaapi.BADADDR), 4),
+            "double": (lambda a: ida_bytes.create_data(a, idaapi.FF_DOUBLE, 8, idaapi.BADADDR), 8),
+        }
+
+        if data_type == "ascii":
+            # Create ASCII string — auto-detect length
+            length = ida_bytes.get_max_strlit_length(ea, ida_nalt.STRTYPE_C)
+            if length < 1:
+                length = 1
+            if idc.create_strlit(ea, ea + length):
+                return f"Created ASCII string at {hex(ea)} (length {length})"
+            else:
+                return f"Failed to create ASCII string at {hex(ea)}"
+
+        if data_type in type_map:
+            func, size = type_map[data_type]
+            if func(ea):
+                return f"Created {data_type} at {hex(ea)}"
+            else:
+                return f"Failed to create {data_type} at {hex(ea)}"
+
+        # Try as C type string
+        try:
+            tif = ida_typeinf.tinfo_t()
+            til = ida_typeinf.get_idati()
+            decl = data_type if data_type.rstrip().endswith(";") else data_type + ";"
+            if ida_typeinf.parse_decl(tif, til, decl, ida_typeinf.PT_SIL):
+                if ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
+                    return f"Applied type '{data_type}' at {hex(ea)}"
+                else:
+                    return f"Failed to apply type at {hex(ea)}"
+            else:
+                return f"Unknown data type: {data_type}"
+        except Exception as e:
+            return f"Failed: {e}"
+
+    # ================================================================== #
+    #  34. get_data_vars (NEW — feature parity with BinAssistMCP)
+    # ================================================================== #
+
+    @_tool("get_data_vars", annotations=READ_ONLY)
+    @_ida_main_thread
+    def get_data_vars(ctx: Context, segment_name: str = "",
+                      limit: int = 200, offset: int = 0) -> dict:
+        """Get defined data variables (non-code items).
+
+        Args:
+            segment_name: Optional segment name filter (e.g. '.data', '.rodata')
+            limit: Maximum number of results
+            offset: Number of items to skip
+
+        Returns:
+            Dictionary with list of data variables and pagination.
+        """
+        data_vars = []
+        skipped = 0
+
+        for seg_idx in range(ida_segment.get_segm_qty()):
+            seg = ida_segment.getnseg(seg_idx)
+            if seg is None:
+                continue
+
+            seg_nm = ida_segment.get_segm_name(seg) or ""
+            if segment_name and segment_name.lower() not in seg_nm.lower():
+                continue
+
+            ea = seg.start_ea
+            while ea < seg.end_ea and ea != idaapi.BADADDR:
+                flags = ida_bytes.get_flags(ea)
+                # Skip code heads — we only want data
+                if not ida_bytes.is_code(flags) and ida_bytes.is_head(flags):
+                    if skipped < offset:
+                        skipped += 1
+                    else:
+                        name = ida_name.get_name(ea) or ""
+                        item_size = ida_bytes.get_item_size(ea)
+
+                        entry = {
+                            "address": hex(ea),
+                            "size": item_size,
+                            "segment": seg_nm,
+                        }
+                        if name:
+                            entry["name"] = name
+
+                        data_vars.append(entry)
+                        if len(data_vars) >= limit:
+                            return {
+                                "data_vars": data_vars,
+                                "count": len(data_vars),
+                                "offset": offset,
+                                "limit": limit,
+                                "truncated": True,
+                            }
+
+                ea = ida_bytes.next_head(ea, seg.end_ea)
+
+        return {
+            "data_vars": data_vars,
+            "count": len(data_vars),
+            "offset": offset,
+            "limit": limit,
+            "truncated": False,
+        }
+
+    # ================================================================== #
+    #  35-38. Task Management
     # ================================================================== #
 
     @_tool("start_task", annotations=NON_IDEMPOTENT)
@@ -1159,357 +1761,6 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
             "cancelled": success,
             "message": "Task cancellation initiated" if success else "Task not found or already completed",
         }
-
-    # ================================================================== #
-    #  34. Get data at address
-    # ================================================================== #
-
-    @_tool("get_data_at", annotations=READ_ONLY)
-    @_ida_main_thread
-    def get_data_at(address: str, ctx: Context, size: int = 0) -> dict:
-        """Get typed data at a specific address.
-
-        Args:
-            address: Hex address
-            size: Optional explicit size (0 = auto-detect from IDB item)
-
-        Returns:
-            Dictionary with typed data values.
-        """
-        ea = parse_address(address)
-        if ea is None:
-            return {"error": f"Invalid address: {address}"}
-
-        if size == 0:
-            size = ida_bytes.get_item_size(ea)
-            if size == 0:
-                size = 8  # fallback
-
-        data = ida_bytes.get_bytes(ea, min(size, 4096))
-        if data is None:
-            return {"error": f"Cannot read at {hex(ea)}"}
-
-        result = {
-            "address": hex(ea),
-            "item_size": size,
-            "hex": data.hex(),
-        }
-
-        # Try to read typed values
-        if size >= 1:
-            result["byte"] = ida_bytes.get_byte(ea)
-        if size >= 2:
-            result["word"] = ida_bytes.get_word(ea)
-        if size >= 4:
-            result["dword"] = ida_bytes.get_dword(ea)
-        if size >= 8:
-            result["qword"] = ida_bytes.get_qword(ea)
-
-        # Name at address
-        name = ida_name.get_name(ea)
-        if name:
-            result["name"] = name
-
-        return result
-
-    # ================================================================== #
-    #  35. Search bytes
-    # ================================================================== #
-
-    @_tool("search_bytes", annotations=READ_ONLY)
-    @_ida_main_thread
-    def search_bytes(pattern: str, ctx: Context, start_address: str = "",
-                     max_results: int = 100) -> list:
-        """Search for a byte pattern in the binary.
-
-        Args:
-            pattern: Hex byte pattern (e.g. '90 90 90' or '4883EC')
-            start_address: Optional start address (default: binary start)
-            max_results: Maximum number of results
-
-        Returns:
-            List of matching addresses.
-        """
-        # Normalize pattern: "90 90" -> "90 90", "9090" -> "90 90"
-        clean = pattern.replace(" ", "")
-        if len(clean) % 2 != 0:
-            return [{"error": "Pattern must have even number of hex chars"}]
-
-        # Build IDA search pattern string
-        search_pattern = " ".join(clean[i:i+2] for i in range(0, len(clean), 2))
-
-        if start_address:
-            start_ea = parse_address(start_address)
-            if start_ea is None:
-                return [{"error": f"Invalid start address: {start_address}"}]
-        else:
-            start_ea = ida_ida.inf_get_min_ea()
-
-        # Compile the binary pattern once
-        compiled = ida_bytes.compiled_binpat_vec_t()
-        ida_bytes.parse_binpat_str(compiled, start_ea, search_pattern, 16)
-
-        results = []
-        ea = start_ea
-        for _ in range(max_results):
-            ea = ida_bytes.bin_search(ea, idaapi.BADADDR, compiled,
-                                      ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOBREAK)
-            if ea == idaapi.BADADDR:
-                break
-
-            func = ida_funcs.get_func(ea)
-            fname = ida_funcs.get_func_name(func.start_ea) if func else None
-
-            results.append({
-                "address": hex(ea),
-                "function": fname,
-            })
-            ea += 1  # advance past match
-
-        return results
-
-    # ================================================================== #
-    #  36. Get entry points
-    # ================================================================== #
-
-    @_tool("get_entry_points", annotations=READ_ONLY)
-    @_ida_main_thread
-    def get_entry_points(ctx: Context) -> list:
-        """Get all binary entry points.
-
-        Returns:
-            List of entry point dictionaries with name and address.
-        """
-        entries = []
-        for i in range(ida_entry.get_entry_qty()):
-            ordinal = ida_entry.get_entry_ordinal(i)
-            ea = ida_entry.get_entry(ordinal)
-            name = ida_entry.get_entry_name(ordinal) or f"entry_{ordinal}"
-            entries.append({
-                "name": name,
-                "address": hex(ea),
-                "ordinal": ordinal,
-            })
-        return entries
-
-    # ================================================================== #
-    #  Additional tools for parity with BinAssistMCP
-    # ================================================================== #
-
-    @_tool("rename_symbol", annotations=MODIFY)
-    @_ida_main_thread
-    def rename_symbol(address_or_name: str, new_name: str, ctx: Context) -> str:
-        """Rename any symbol (function or data) at the given address/name.
-
-        Args:
-            address_or_name: Current address or name
-            new_name: New name
-
-        Returns:
-            Success or failure message.
-        """
-        ea = _resolve(address_or_name)
-        old_name = ida_name.get_name(ea) or f"loc_{ea:x}"
-        if ida_name.set_name(ea, new_name, ida_name.SN_CHECK):
-            return f"Renamed '{old_name}' to '{new_name}'"
-        else:
-            return f"Failed to rename to '{new_name}'"
-
-    @_tool("get_function_statistics", annotations=READ_ONLY)
-    @_ida_main_thread
-    def get_function_statistics(ctx: Context) -> dict:
-        """Get comprehensive statistics about all functions in the binary.
-
-        Returns:
-            Statistics including counts, sizes, and top functions.
-        """
-        sizes = []
-        for func_ea in idautils.Functions():
-            func = ida_funcs.get_func(func_ea)
-            if func:
-                sizes.append((func_ea, func.end_ea - func.start_ea))
-
-        if not sizes:
-            return {"error": "No functions found"}
-
-        total_size = sum(s for _, s in sizes)
-        avg_size = total_size // len(sizes) if sizes else 0
-        sorted_by_size = sorted(sizes, key=lambda x: x[1], reverse=True)
-
-        top_10 = []
-        for ea, sz in sorted_by_size[:10]:
-            top_10.append({
-                "name": ida_funcs.get_func_name(ea),
-                "address": hex(ea),
-                "size": sz,
-            })
-
-        return {
-            "total_functions": len(sizes),
-            "total_code_size": total_size,
-            "average_size": avg_size,
-            "max_size": sorted_by_size[0][1] if sorted_by_size else 0,
-            "min_size": sorted_by_size[-1][1] if sorted_by_size else 0,
-            "top_10_largest": top_10,
-        }
-
-    @_tool("batch_rename", annotations=MODIFY)
-    @_ida_main_thread
-    def batch_rename(renames: list, ctx: Context) -> list:
-        """Batch rename multiple symbols.
-
-        Args:
-            renames: List of dicts with 'address_or_name' and 'new_name' keys
-
-        Returns:
-            List of results for each rename operation.
-        """
-        results = []
-        for entry in renames:
-            addr_or_name = entry.get("address_or_name", "")
-            new_name = entry.get("new_name", "")
-            if not addr_or_name or not new_name:
-                results.append({"address_or_name": addr_or_name, "success": False, "error": "Missing fields"})
-                continue
-
-            try:
-                ea = _resolve(addr_or_name)
-                old_name = ida_name.get_name(ea) or f"loc_{ea:x}"
-                success = ida_name.set_name(ea, new_name, ida_name.SN_CHECK)
-
-                results.append({
-                    "address": hex(ea),
-                    "old_name": old_name,
-                    "new_name": new_name,
-                    "success": success,
-                })
-            except Exception as e:
-                results.append({"address_or_name": addr_or_name, "success": False, "error": str(e)})
-
-        return results
-
-    @_tool("search_strings", annotations=READ_ONLY)
-    @_ida_main_thread
-    def search_strings(pattern: str, ctx: Context, case_sensitive: bool = False,
-                       page_size: int = 100, page_number: int = 1) -> dict:
-        """Search for strings matching a pattern with pagination.
-
-        Args:
-            pattern: Search pattern (substring match)
-            case_sensitive: Case-sensitive matching
-            page_size: Number of results per page
-            page_number: Page number (1-indexed)
-
-        Returns:
-            Dictionary with matching strings and pagination info.
-        """
-        matches = []
-        pat = pattern if case_sensitive else pattern.lower()
-
-        for s in idautils.Strings():
-            value = str(s)
-            compare = value if case_sensitive else value.lower()
-            if pat in compare:
-                matches.append({
-                    "address": hex(s.ea),
-                    "value": value,
-                    "length": s.length,
-                })
-
-        total = len(matches)
-        total_pages = max(1, (total + page_size - 1) // page_size)
-        start = (page_number - 1) * page_size
-        page = matches[start:start + page_size]
-
-        return {
-            "strings": page,
-            "page_size": page_size,
-            "page_number": page_number,
-            "total_count": total,
-            "total_pages": total_pages,
-        }
-
-    @_tool("get_code", annotations=READ_ONLY)
-    def get_code(function_name_or_address: str, ctx: Context,
-                 format: str = "decompile") -> dict:
-        """Get function code in specified format (unified tool).
-
-        Args:
-            function_name_or_address: Function identifier
-            format: Output format - 'decompile' or 'disasm'
-
-        Returns:
-            Dictionary with function info and code.
-        """
-        if format == "disasm":
-            return get_disassembly(function_name_or_address, ctx)
-        else:
-            return decompile_function(function_name_or_address, ctx)
-
-    @_tool("analyze_function", annotations=READ_ONLY)
-    @_ida_main_thread
-    def analyze_function(function_name_or_address: str, ctx: Context) -> dict:
-        """Perform comprehensive analysis of a function.
-
-        Args:
-            function_name_or_address: Function name or address
-
-        Returns:
-            Comprehensive function analysis including control flow and call info.
-        """
-        ea = _resolve(function_name_or_address)
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return {"error": f"No function at {hex(ea)}"}
-
-        func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:x}"
-
-        # Basic info
-        result = {
-            "name": func_name,
-            "address": hex(func.start_ea),
-            "end": hex(func.end_ea),
-            "size": func.end_ea - func.start_ea,
-        }
-
-        # Basic blocks (CFG complexity)
-        flow = idaapi.FlowChart(func)
-        blocks = list(flow)
-        result["basic_block_count"] = len(blocks)
-
-        # Instruction count
-        instructions = list(idautils.FuncItems(func.start_ea))
-        result["instruction_count"] = len(instructions)
-
-        # Callers and callees
-        callers = set()
-        for ref in idautils.CodeRefsTo(func.start_ea, 0):
-            cfunc = ida_funcs.get_func(ref)
-            if cfunc:
-                callers.add(ida_funcs.get_func_name(cfunc.start_ea))
-
-        callees = set()
-        for item_ea in instructions:
-            for ref in idautils.CodeRefsFrom(item_ea, 0):
-                cfunc = ida_funcs.get_func(ref)
-                if cfunc and cfunc.start_ea != func.start_ea:
-                    callees.add(ida_funcs.get_func_name(cfunc.start_ea))
-
-        result["callers"] = list(callers)
-        result["callees"] = list(callees)
-        result["caller_count"] = len(callers)
-        result["callee_count"] = len(callees)
-
-        # Try decompilation
-        try:
-            cfunc = ida_hexrays.decompile(func.start_ea)
-            if cfunc:
-                result["decompiled"] = str(cfunc)
-                result["variable_count"] = len(cfunc.get_lvars())
-        except Exception:
-            result["decompiled"] = None
-
-        return result
 
     @_tool("list_tasks", annotations=READ_ONLY)
     def list_tasks(ctx: Context, status: str = "") -> list:

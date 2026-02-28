@@ -1,0 +1,26 @@
+{
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "idassistmcp",
+    "entryPoint": "idassistmcp_plugin.py",
+    "version": "1.0.0",
+    "description": "Standalone MCP server plugin exposing IDA Pro's analysis capabilities to LLM clients",
+    "license": "MIT",
+    "urls": {
+      "repository": "https://github.com/jtang613/IDAssistMCP"
+    },
+    "authors": [
+      {
+        "name": "Jason Tang"
+      }
+    ],
+    "keywords": ["mcp", "llm", "reverse-engineering", "model-context-protocol", "analysis"],
+    "pythonDependencies": [
+      "mcp>=1.23.3",
+      "anyio>=4.0.0",
+      "hypercorn>=0.16.0",
+      "pydantic>=2.0.0",
+      "pydantic-settings>=2.0.0"
+    ]
+  }
+}

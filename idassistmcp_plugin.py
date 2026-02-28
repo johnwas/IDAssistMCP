@@ -35,6 +35,30 @@ if _SRC_DIR not in sys.path:
 
 
 # --------------------------------------------------------------------------- #
+# Deferred UI hook
+# --------------------------------------------------------------------------- #
+
+class _DeferredOpenHook(ida_kernwin.UI_Hooks):
+    """One-shot hook to open config panel after IDA's UI is fully ready."""
+
+    def __init__(self, plugin):
+        super().__init__()
+        self._plugin = plugin
+
+    def ready_to_run(self):
+        try:
+            from idassist_mcp.ui.config_panel import IDAssistMCPPanel
+            IDAssistMCPPanel.open(self._plugin)
+        except Exception as e:
+            ida_kernwin.msg(f"[IDAssistMCP] Failed to open config panel: {e}\n")
+        # Bring IDAssist tab to front so IDAssistMCP sits behind it
+        w = ida_kernwin.find_widget("IDAssist")
+        if w:
+            ida_kernwin.activate_widget(w, True)
+        self.unhook()
+
+
+# --------------------------------------------------------------------------- #
 # Plugin class
 # --------------------------------------------------------------------------- #
 
@@ -71,16 +95,9 @@ class IDAssistMCPPlugin(idaapi.plugin_t):
             ida_kernwin.msg("[IDAssistMCP] Auto-starting server...\n")
             self._start_server()
 
-        # Open config panel after UI is ready (one-shot timer)
-        def _open_panel():
-            try:
-                from idassist_mcp.ui.config_panel import IDAssistMCPPanel
-                IDAssistMCPPanel.open(self)
-            except Exception as e:
-                ida_kernwin.msg(f"[IDAssistMCP] Failed to open config panel: {e}\n")
-            return -1  # negative = don't repeat
-
-        idaapi.register_timer(500, _open_panel)
+        # Defer panel open until IDA's UI is fully ready
+        self._deferred_hook = _DeferredOpenHook(self)
+        self._deferred_hook.hook()
 
         return idaapi.PLUGIN_KEEP
 
