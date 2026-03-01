@@ -31,36 +31,32 @@ hcli plugin install idassistmcp
 
 This automatically installs the plugin and its Python dependencies.
 
-### Option 2: Manual install (symlink for development)
+### Option 2: Manual install (from release tarball)
 
-Install dependencies using **IDA's bundled Python** (not your system Python):
+Download the latest release zip from [GitHub Releases](https://github.com/jtang613/IDAssistMCP/releases) and extract it into your IDA plugins directory:
 
 **Linux / macOS:**
 ```bash
-<IDA_INSTALL_DIR>/python3/bin/pip3 install -r requirements.txt
+unzip IDAssistMCP-*.zip -d ~/.idapro/plugins/
+```
+
+**Windows:**
+Extract the zip into `%APPDATA%\Hex-Rays\IDA Pro\plugins\`.
+
+Then install dependencies using **IDA's bundled Python** (not your system Python):
+
+**Linux / macOS:**
+```bash
+<IDA_INSTALL_DIR>/python3/bin/pip3 install -r ~/.idapro/plugins/IDAssistMCP/requirements.txt
 ```
 
 **Windows:**
 ```cmd
-"<IDA_INSTALL_DIR>\python3\python.exe" -m pip install -r requirements.txt
+"<IDA_INSTALL_DIR>\python3\python.exe" -m pip install -r "%APPDATA%\Hex-Rays\IDA Pro\plugins\IDAssistMCP\requirements.txt"
 ```
 
 > Replace `<IDA_INSTALL_DIR>` with your IDA Pro installation path.
-
-Then symlink the plugin file:
-
-**Linux / macOS:**
-```bash
-ln -s /path/to/IDAssistMCP/idassistmcp_plugin.py ~/.idapro/plugins/idassistmcp_plugin.py
-```
-
-**Windows (requires Administrator or Developer Mode):**
-```cmd
-mklink "%APPDATA%\Hex-Rays\IDA Pro\plugins\idassistmcp_plugin.py" "C:\path\to\IDAssistMCP\idassistmcp_plugin.py"
-```
-
-The symlink is resolved at runtime, so the plugin automatically finds its `src/` directory in the original checkout.
-
+>
 > **Tip:** You can also use the `IDAUSR` environment variable to specify a custom plugins directory.
 
 ## Usage
