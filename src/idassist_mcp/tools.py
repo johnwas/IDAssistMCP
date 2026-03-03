@@ -91,13 +91,59 @@ def register_tools(mcp: FastMCP, disabled_tools=None):
         def logging_decorator(fn):
             @functools.wraps(fn)
             def wrapper(*args, **kw):
-                log.log_info(f"Tool called: {name}")
-                return fn(*args, **kw)
+                # Record call arguments (skip ctx argument)
+                call_args = {}
+                if args:
+                    call_args['args'] = [truncate_string(str(a), 200) for a in args[1:]]  # Skip self/ctx
+                if kw:
+                    # Filter out ctx argument
+                    filtered_kw = {k: truncate_string(str(v), 200) for k, v in kw.items() if k != 'ctx'}
+                    if filtered_kw:
+                        call_args['kwargs'] = filtered_kw
+                log.log_info(f"Tool called: {name}, args: {json.dumps(call_args, ensure_ascii=False, indent=2)}")
+
+                # Call function and record return value
+                result = fn(*args, **kw)
+                # Try to format return value as JSON
+                try:
+                    if isinstance(result, dict):
+                        result_json = json.dumps(result, ensure_ascii=False, indent=2)
+                    elif isinstance(result, list):
+                        result_json = json.dumps(result, ensure_ascii=False, indent=2)
+                    else:
+                        result_json = truncate_string(str(result), 500)
+                except (TypeError, ValueError):
+                    result_json = truncate_string(str(result), 500)
+                log.log_info(f"Tool returned: {name}, result: {result_json}")
+                return result
 
             @functools.wraps(fn)
             async def async_wrapper(*args, **kw):
-                log.log_info(f"Tool called: {name}")
-                return await fn(*args, **kw)
+                # Record call arguments (skip ctx argument)
+                call_args = {}
+                if args:
+                    call_args['args'] = [truncate_string(str(a), 200) for a in args[1:]]  # Skip self/ctx
+                if kw:
+                    # Filter out ctx argument
+                    filtered_kw = {k: truncate_string(str(v), 200) for k, v in kw.items() if k != 'ctx'}
+                    if filtered_kw:
+                        call_args['kwargs'] = filtered_kw
+                log.log_info(f"Tool called: {name}, args: {json.dumps(call_args, ensure_ascii=False, indent=2)}")
+
+                # Call function and record return value
+                result = await fn(*args, **kw)
+                # Try to format return value as JSON
+                try:
+                    if isinstance(result, dict):
+                        result_json = json.dumps(result, ensure_ascii=False, indent=2)
+                    elif isinstance(result, list):
+                        result_json = json.dumps(result, ensure_ascii=False, indent=2)
+                    else:
+                        result_json = truncate_string(str(result), 500)
+                except (TypeError, ValueError):
+                    result_json = truncate_string(str(result), 500)
+                log.log_info(f"Tool returned: {name}, result: {result_json}")
+                return result
 
             import asyncio
             wrapped = async_wrapper if asyncio.iscoroutinefunction(fn) else wrapper

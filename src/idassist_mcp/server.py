@@ -7,7 +7,7 @@ and IDA Pro integration for the single-binary context.
 
 import warnings
 from contextlib import asynccontextmanager
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import AsyncIterator, Optional
 
 import asyncio
@@ -23,6 +23,36 @@ from .config import IDAssistMCPConfig, TransportType
 from .context import IDAContextManager
 from .logging import log
 from .tasks import TaskManager, TaskStatus, get_task_manager
+
+
+_lifespan_log_lock = Lock()
+_lifespan_enter_logged = False
+
+
+def _is_expected_asgi_disconnect_error(exc: BaseException) -> bool:
+    """Return True for noisy, expected disconnect/shutdown exceptions."""
+    error_msg = str(exc)
+    lower_msg = error_msg.lower()
+    return (
+        isinstance(exc, asyncio.CancelledError) or
+        "asgihttpstate" in error_msg or
+        "connection" in lower_msg or
+        "closed" in lower_msg or
+        "response already" in lower_msg or
+        "unexpected message type" in error_msg or
+        "cancelled" in lower_msg or
+        "bound to a different event loop" in lower_msg
+    )
+
+
+def _reset_sse_starlette_app_status() -> None:
+    """Reset sse-starlette global AppStatus to avoid cross-event-loop reuse."""
+    try:
+        from sse_starlette.sse import AppStatus
+        AppStatus.should_exit = False
+        AppStatus.should_exit_event = None
+    except Exception as e:
+        log.log_debug(f"Unable to reset sse-starlette AppStatus: {e}")
 
 
 class ResourceManagedASGIApp:
@@ -65,28 +95,14 @@ class ResourceManagedASGIApp:
             if sys.version_info >= (3, 11) and isinstance(e, BaseExceptionGroup):
                 log.log_debug(f"ASGI exception group during request: {e}")
                 for exc in e.exceptions:
-                    error_msg = str(exc)
-                    if ("ASGIHTTPState" in error_msg or
-                        "connection" in error_msg.lower() or
-                        "closed" in error_msg.lower() or
-                        "response already" in error_msg.lower() or
-                        "Unexpected message type" in error_msg or
-                        "cancelled" in error_msg.lower() or
-                        isinstance(exc, asyncio.CancelledError)):
+                    if _is_expected_asgi_disconnect_error(exc):
                         log.log_debug(f"Client disconnect or ASGI state error (expected): {exc}")
                     else:
                         log.log_warn(f"Unexpected exception in request group: {exc}")
                         log.log_debug(f"Traceback: {''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}")
                 return
 
-            error_msg = str(e)
-            if ("ASGIHTTPState" in error_msg or
-                "connection" in error_msg.lower() or
-                "closed" in error_msg.lower() or
-                "response already" in error_msg.lower() or
-                "Unexpected message type" in error_msg or
-                "cancelled" in error_msg.lower() or
-                isinstance(e, asyncio.CancelledError)):
+            if _is_expected_asgi_disconnect_error(e):
                 log.log_debug(f"Client disconnect or ASGI state error (expected): {e}")
             else:
                 log.log_warn(f"Unexpected ASGI exception during request: {e}")
@@ -98,16 +114,13 @@ class ResourceManagedASGIApp:
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[IDAContextManager]:
-    """Application lifecycle manager for the MCP server."""
+    """Session-scoped lifespan manager used by FastMCP request handling."""
+    global _lifespan_enter_logged
     context_manager = IDAContextManager()
-
-    # Refresh context from current IDB
-    try:
-        context_manager.refresh()
-    except Exception as e:
-        log.log_error(f"Failed to refresh IDA context on startup: {e}")
-
-    log.log_info("IDAssistMCP server started")
+    with _lifespan_log_lock:
+        if not _lifespan_enter_logged:
+            log.log_debug("MCP session lifespan entered (first session; suppressing duplicates)")
+            _lifespan_enter_logged = True
 
     try:
         yield context_manager
@@ -151,10 +164,10 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[IDAContextManager]:
                 raise
     finally:
         try:
-            log.log_info("Shutting down server, clearing IDA context")
+            log.log_debug("MCP session lifespan exiting, clearing IDA context")
             context_manager.clear()
-            await asyncio.sleep(0.5)
-            log.log_info("Server lifespan cleanup completed")
+            await asyncio.sleep(0.1)
+            log.log_debug("MCP session lifespan cleanup completed")
         except Exception as e:
             log.log_error(f"Error during server shutdown: {e}")
 
@@ -171,7 +184,8 @@ class SSEServerThread(Thread):
         self.hypercorn_config.bind = [f"{config.server.host}:{config.server.port}"]
 
         self.hypercorn_config.keep_alive_timeout = 5
-        self.hypercorn_config.graceful_timeout = 10
+        # Keep shutdown responsive in IDA UI while still allowing brief graceful drain.
+        self.hypercorn_config.graceful_timeout = 2
 
         # Disable hypercorn's logging
         self.hypercorn_config.access_log_format = ""
@@ -206,74 +220,46 @@ class SSEServerThread(Thread):
         import sys
         import traceback
 
-        while not self.shutdown_signal.is_set():
-            try:
-                await serve(
-                    self.asgi_app,
-                    self.hypercorn_config,
-                    shutdown_trigger=self._shutdown_trigger
-                )
-                break
-            except BaseException as e:
-                if self.shutdown_signal.is_set():
-                    break
-
-                is_recoverable = False
-
-                if sys.version_info >= (3, 11) and isinstance(e, BaseExceptionGroup):
-                    all_recoverable = True
-                    for exc in e.exceptions:
-                        if not self._is_recoverable_exception(exc, str(exc)):
-                            all_recoverable = False
-                            log.log_error(f"Unrecoverable sub-exception: {exc}")
-                    is_recoverable = all_recoverable
-                else:
-                    is_recoverable = self._is_recoverable_exception(e, str(e))
-
-                if is_recoverable:
-                    log.log_info("Recoverable error encountered, server continuing...")
-                    await asyncio.sleep(0.1)
-                    continue
-                else:
-                    log.log_error("Unrecoverable server error, stopping server")
-                    break
-
+        # Only call serve() once - it's a blocking call that runs until shutdown
+        # Don't retry on recoverable exceptions as that causes lifespan re-initialization
         try:
-            await asyncio.sleep(1.0)
-        except Exception:
+            await serve(
+                self.asgi_app,
+                self.hypercorn_config,
+                shutdown_trigger=self._shutdown_trigger
+            )
+        except asyncio.CancelledError:
             pass
+        except BaseException as e:
+            if self.shutdown_signal.is_set():
+                # Expected during shutdown
+                pass
+            else:
+                log.log_error(f"MCP server error: {e}")
+                import traceback
+                log.log_error(f"MCP server traceback: {traceback.format_exc()}")
 
-    def _is_recoverable_exception(self, exc: BaseException, error_msg: str) -> bool:
-        if isinstance(exc, asyncio.CancelledError):
-            return True
-
-        recoverable_patterns = [
-            "connection", "closed", "ASGIHTTPState", "response already",
-            "Unexpected message type", "client disconnect", "broken pipe",
-            "reset by peer", "stream",
-        ]
-
-        error_msg_lower = error_msg.lower()
-        for pattern in recoverable_patterns:
-            if pattern.lower() in error_msg_lower:
-                return True
-
-        return False
+        # Avoid extra shutdown delay after Hypercorn exits.
+        await asyncio.sleep(0)
 
     async def _shutdown_trigger(self):
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.shutdown_signal.wait)
-        log.log_info("Shutdown signal received")
-        await asyncio.sleep(0.5)
+        # Use threading.Event.wait() with timeout to avoid event loop binding issues
+        # The shutdown_signal is set from another thread, so we need to poll
+        import time
+        while not self.shutdown_signal.is_set():
+            await asyncio.sleep(0.1)
+        log.log_debug("Shutdown signal observed in server loop")
+        await asyncio.sleep(0)
 
-    def stop(self):
+    def stop(self, wait: bool = True, timeout: float = 2.0):
         log.log_info("Stopping MCP server")
         self.shutdown_signal.set()
+        log.log_info("Shutdown signal sent")
 
-        if self.is_alive():
-            self.join(timeout=5.0)
+        if wait and self.is_alive():
+            self.join(timeout=timeout)
             if self.is_alive():
-                log.log_warn("MCP server thread did not shut down cleanly within 5 seconds")
+                log.log_warn(f"MCP server thread did not shut down cleanly within {timeout} seconds")
             else:
                 log.log_info("MCP server thread shutdown completed")
 
@@ -391,6 +377,7 @@ class IDAssistMCPServer:
             # Get ASGI app based on transport type
             if self.config.is_transport_enabled(TransportType.SSE):
                 log.log_info("Creating SSE ASGI app...")
+                _reset_sse_starlette_app_status()
                 if hasattr(self.mcp_server, 'sse_app'):
                     asgi_app = self.mcp_server.sse_app()
                 else:
@@ -439,9 +426,9 @@ class IDAssistMCPServer:
         try:
             if self._server_thread:
                 try:
-                    self._server_thread.stop()
+                    self._server_thread.stop(wait=False)
                     if self._server_thread.is_alive():
-                        self._server_thread.join(timeout=10.0)
+                        self._server_thread.join(timeout=2.0)
                 except Exception as e:
                     log.log_error(f"Error stopping server thread: {e}")
                 finally:

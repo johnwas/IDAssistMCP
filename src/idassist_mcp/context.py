@@ -81,10 +81,13 @@ class IDAContextManager:
         self._context: Optional[IDABinaryContext] = None
         self._lock = threading.RLock()
 
-    def refresh(self) -> IDABinaryContext:
+    def refresh(self, force: bool = False) -> IDABinaryContext:
         """Rebuild context from the current IDB.
 
         All IDA API calls run on the main thread via execute_on_main_thread.
+
+        Args:
+            force: If True, force refresh even if already initialized.
 
         Returns:
             Updated IDABinaryContext
